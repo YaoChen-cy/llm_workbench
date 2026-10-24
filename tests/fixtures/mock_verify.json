@@ -1,0 +1,9 @@
+[
+  {"point_id": "SR-1", "verdict": "supported", "issue": ""},
+  {"point_id": "SR-2", "verdict": "supported", "issue": ""},
+  {"point_id": "SR-3", "verdict": "supported", "issue": ""},
+  {"point_id": "RD-1", "verdict": "supported", "issue": ""},
+  {"point_id": "RD-2", "verdict": "supported", "issue": ""},
+  {"point_id": "RD-3", "verdict": "unsupported", "issue": "Memo states the increase was $11.3mm, not $12.3mm."},
+  {"point_id": "RD-4", "verdict": "supported", "issue": ""}
+]

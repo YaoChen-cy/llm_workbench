@@ -1,0 +1,110 @@
+{
+  "situation_recap": [
+    {
+      "text": "Harborline is a Crestmark-sponsored, vertically integrated furniture designer and retailer (118 showrooms, FY2025 revenue **$1.42bn**). The collapse in existing home sales drove same-store sales down 9% in FY2024 and **14% in FY2025**, compounded by tariffs raising case-goods landed costs by ~18% and a failed ERP migration.",
+      "cites": [
+        "OV-1",
+        "RR-1",
+        "RR-2",
+        "RR-4"
+      ],
+      "id": "SR-1",
+      "checks": {
+        "numbers_not_found": [],
+        "llm_verdict": "supported",
+        "llm_issue": ""
+      },
+      "flagged": false
+    },
+    {
+      "text": "Adj. EBITDA fell from $212mm (FY2022) to $71mm (FY2025), margin compressing from 12.4% to **5.0%**; with **$1.35bn** of funded debt (ABL, $850mm 1st Lien TLB, $360mm 2nd Lien Notes), leverage reached **19.3x**. The Bank holds **$45.0mm** of the 1st Lien TLB.",
+      "cites": [
+        "RR-5",
+        "OV-3"
+      ],
+      "id": "SR-2",
+      "checks": {
+        "numbers_not_found": [],
+        "llm_verdict": "supported",
+        "llm_issue": ""
+      },
+      "flagged": false
+    },
+    {
+      "text": "After a failed turnaround, the Company engaged restructuring advisors in February 2026, skipped the March 2026 2nd Lien coupon and entered ABL forbearance; the credit was downgraded to **Doubtful in April 2026**.",
+      "cites": [
+        "RR-6"
+      ],
+      "id": "SR-3",
+      "checks": {
+        "numbers_not_found": [],
+        "llm_verdict": "supported",
+        "llm_issue": ""
+      },
+      "flagged": false
+    }
+  ],
+  "recent_development": [
+    {
+      "text": "Harborline filed **Chapter 11 on August 4, 2026** (D. Del.) with an RSA supported by ~78% of the 1st Lien TLB, including the Bank. A **$150mm DIP** ($100mm new money, $50mm 1st Lien roll-up) received final approval; the Bank did not participate.",
+      "cites": [
+        "TU-1",
+        "TU-2"
+      ],
+      "id": "RD-1",
+      "checks": {
+        "numbers_not_found": [],
+        "llm_verdict": "supported",
+        "llm_issue": ""
+      },
+      "flagged": false
+    },
+    {
+      "text": "Under the Plan, 1st Lien lenders receive pro-rata a **$150mm Exit Term Loan** and **85% of reorganized equity** (subject to a 10% MIP); 2nd Lien receives 15% plus warrants; GUCs share a $6mm cash pool, with cramdown if the class rejects; sponsor equity is cancelled.",
+      "cites": [
+        "TU-4",
+        "TU-5",
+        "TU-6",
+        "TU-7"
+      ],
+      "id": "RD-2",
+      "checks": {
+        "numbers_not_found": [],
+        "llm_verdict": "supported",
+        "llm_issue": ""
+      },
+      "flagged": false
+    },
+    {
+      "text": "Provision increased from $18.0mm to **$29.3mm (65% of exposure)** in September 2026, an increase of **$12.3mm**, driven by the Disclosure Statement EV of **$420mm** vs. $600mm previously assumed, implying ~35% 1st Lien recovery.",
+      "cites": [
+        "PR-1",
+        "PR-2"
+      ],
+      "id": "RD-3",
+      "checks": {
+        "numbers_not_found": [
+          "$12.3mm"
+        ],
+        "llm_verdict": "unsupported",
+        "llm_issue": "Memo states the increase was $11.3mm, not $12.3mm."
+      },
+      "flagged": true
+    },
+    {
+      "text": "The Bank's estimated recovery of **$15.7mm** comprises ~$7.9mm of Exit TL and ~4.5% of reorganized equity. The Disclosure Statement hearing is set for **October 28, 2026**, with emergence targeted for Q1 2027.",
+      "cites": [
+        "PR-3",
+        "TU-8",
+        "OL-4"
+      ],
+      "id": "RD-4",
+      "checks": {
+        "numbers_not_found": [],
+        "llm_verdict": "supported",
+        "llm_issue": ""
+      },
+      "flagged": false
+    }
+  ]
+}

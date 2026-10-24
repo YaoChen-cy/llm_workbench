@@ -21,7 +21,7 @@ import pymupdf
 
 from .settings import DOCS_DIR
 
-PARSER_VERSION = 1
+PARSER_VERSION = 2
 HEADER_FOOTER_BAND = 0.08      # top/bottom fraction of the page checked for running headers/footers
 MAX_HEADING_CHARS = 120
 
@@ -287,19 +287,38 @@ def parse_docx(path: Path) -> list[dict]:
     return _finish(items)
 
 
+_LIST_ITEM = re.compile(r"^\s*(?:[-*+•]|\d+[.)])\s+")
+
+
+def _strip_md(s: str) -> str:
+    return re.sub(r"(\*\*|__)(.+?)\1", r"\2", s)
+
+
 def parse_text(text: str) -> list[dict]:
+    """Blank-line separated chunks; '#' headings, '|' tables, and one block per list item."""
     items = []
-    for chunk in re.split(r"\n\s*\n", text):
+    for chunk in re.split(r"\n\s*\n", text.replace("\r\n", "\n")):
         chunk = chunk.strip()
         if not chunk:
             continue
         m = re.match(r"^(#{1,6})\s+(.+)$", chunk)
         if m and "\n" not in chunk:
-            items.append(("heading", m.group(2).strip(), len(m.group(1))))
+            items.append(("heading", _strip_md(m.group(2).strip()), len(m.group(1))))
+        elif re.fullmatch(r"(\*\*|__)[^*_\n]{1,100}\1:?", chunk):        # a bold line on its own acts as a heading
+            items.append(("heading", _strip_md(chunk).rstrip(":"), 2))
         elif chunk.startswith("|"):
             items.append(("table", chunk, None))
         else:
-            items.append(("paragraph", _norm(chunk), None))
+            # Split list items (a line starting with a bullet or "1.") into separate blocks.
+            parts, cur = [], []
+            for line in chunk.split("\n"):
+                if _LIST_ITEM.match(line) and cur:
+                    parts.append(cur)
+                    cur = []
+                cur.append(line)
+            parts.append(cur)
+            for part in parts:
+                items.append(("paragraph", _norm(_strip_md(" ".join(part))), None))
     return _finish(items)
 
 
@@ -308,3 +327,114 @@ if __name__ == "__main__":
     d = ingest(Path(sys.argv[1]))
     print(json.dumps(meta(d), indent=1))
     print(to_markdown(d, "D1"))
+
+
+# ---------------------------------------------------------------- locating a cited sentence
+
+_SENT_SPLIT = re.compile(r'(?<=[.!?;])["”)]?\s+(?=[A-Z0-9(•"“$-])|\s+(?=•)')
+_TOKEN = re.compile(r"\$?\d[\d,.]*%?x?|[a-z][a-z'’-]+", re.I)
+_NUMERIC = re.compile(r"\d")
+_ABBREV = {"adj", "inc", "corp", "co", "ltd", "llc", "no", "nos", "vs", "approx", "est", "mr", "ms", "mrs", "dr",
+           "st", "jr", "sr", "dept", "fig", "e.g", "i.e", "etc", "jan", "feb", "mar", "apr", "jun", "jul", "aug",
+           "sep", "sept", "oct", "nov", "dec", "p", "pp", "ref", "yr", "mo", "avg"}
+_STOP_WORDS = set("the a an and or of to in on for with by is are was were be been this that its as at from "
+                  "which who has have had it their than into".split())
+
+
+def split_sentences(text: str) -> list[tuple[int, int]]:
+    """Sentence spans (start, end) in `text`; a closing quote/parenthesis stays with its sentence."""
+    spans, start = [], 0
+    for m in _SENT_SPLIT.finditer(text):
+        before = text[:m.start()].rsplit(None, 1)[-1] if text[:m.start()].strip() else ""
+        if before.rstrip(".").lower() in _ABBREV or re.fullmatch(r"[A-Z]\.|(?:[A-Za-z]\.){2,}", before):
+            continue                            # "Adj. EBITDA", "J. Doe", "U.S. Bankruptcy" are not sentence ends
+        spans.append((start, m.start() + len(m.group(0).rstrip())))
+        start = m.end()
+    spans.append((start, len(text)))
+    return [(s, e) for s, e in spans if text[s:e].strip()]
+
+
+def _tokens(text: str) -> list[str]:
+    return [t.lower().rstrip(".,").replace(",", "") for t in _TOKEN.findall(text.replace("**", ""))]
+
+
+def matching_sentences(text: str, claim: str) -> list[tuple[int, int]]:
+    """Sentences of `text` that support `claim` (term overlap, numbers weighted 3x).
+    Returns the best one plus any other sentence scoring at least 70% as well; [] if nothing fits."""
+    claim_terms = {t for t in _tokens(claim) if t not in _STOP_WORDS}
+    spans = split_sentences(text)
+    if not claim_terms or len(spans) <= 1:
+        return []
+    scored = []
+    for s, e in spans:
+        terms = {t for t in _tokens(text[s:e]) if t not in _STOP_WORDS}
+        if terms:
+            hit = sum(3 if _NUMERIC.search(t) else 1 for t in claim_terms & terms)
+            total = sum(3 if _NUMERIC.search(t) else 1 for t in terms)
+            scored.append((hit / total ** 0.5, (s, e)))
+    best = max((sc for sc, _ in scored), default=0)
+    if best < 0.6:
+        return []
+    return [span for sc, span in scored if sc >= max(0.6, best * 0.7)]
+
+
+def _norm_word(w: str) -> str:
+    return re.sub(r"[^\w$%]", "", w.lower())
+
+
+def _sentence_rects(path: str, block: dict, sentence: str) -> list[list]:
+    """Line rectangles of `sentence` inside `block`, found by aligning words on the PDF page(s)."""
+    doc = pymupdf.open(path)
+    words = []                                  # (normalized word, page_index, rect)
+    for pi, *r in block["rects"]:
+        clip = pymupdf.Rect(r) + (-1, -1, 1, 1)
+        for w in doc[pi].get_text("words", clip=clip, sort=True):
+            nw = _norm_word(w[4])
+            if nw:
+                words.append((nw, pi, w[:4]))
+    target = [_norm_word(w) for w in sentence.split() if _norm_word(w)]
+    if not words or not target:
+        return []
+
+    def find(seq, frm, to):
+        k = len(seq)
+        for i in range(frm, to - k + 1):
+            if all(words[i + j][0] == seq[j] or words[i + j][0].startswith(seq[j]) or seq[j].startswith(words[i + j][0])
+                   for j in range(k)):
+                return i
+        return -1
+
+    k = min(3, len(target))
+    start = find(target[:k], 0, len(words))
+    if start < 0:
+        return []
+    end_anchor = find(target[-k:], start, len(words))
+    end = end_anchor + k if end_anchor >= 0 else min(len(words), start + len(target))
+
+    # Merge word boxes into one rectangle per line.
+    lines: list[list] = []
+    for _, pi, (x0, y0, x1, y1) in words[start:end]:
+        if lines and lines[-1][0] == pi and abs(lines[-1][2] - y0) < 3:
+            ln = lines[-1]
+            ln[1], ln[3], ln[4] = min(ln[1], x0), max(ln[3], x1), max(ln[4], y1)
+        else:
+            lines.append([pi, x0, y0, x1, y1])
+    return lines
+
+
+def locate(doc_id: str, block_id: str, claim: str = "") -> dict:
+    """Where a citation points: the block, and the sentence(s) inside it that fit the claim."""
+    doc = get(doc_id)
+    block = next((b for b in doc["blocks"] if b.get("id") == block_id), None)
+    if block is None:
+        raise FileNotFoundError(f"{block_id} not found in {doc['name']}")
+    out = {"doc_id": doc_id, "name": doc["name"], "kind": doc["kind"], "pages": doc["pages"],
+           "block": {k: block[k] for k in ("id", "type", "page", "heading", "text", "rects")},
+           "sentences": [], "sentence_spans": [], "sentence_rects": []}
+    spans = matching_sentences(block["text"], claim) if claim and block["type"] == "paragraph" else []
+    out["sentences"] = [block["text"][s:e] for s, e in spans]
+    out["sentence_spans"] = [list(sp) for sp in spans]
+    if doc["kind"] == "pdf":
+        for sentence in out["sentences"]:
+            out["sentence_rects"] += _sentence_rects(doc["source_path"], block, sentence)
+    return out

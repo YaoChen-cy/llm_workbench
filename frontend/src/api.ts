@@ -104,6 +104,19 @@ export type DocMeta = {
   error?: string;
 };
 
+export type Rect = [number, number, number, number, number]; // [page_index, x0, y0, x1, y1] in PDF points
+
+export type Located = {
+  doc_id: string;
+  name: string;
+  kind: string;
+  pages: number;
+  block: { id: string; type: string; page: number; heading: string; text: string; rects: Rect[] };
+  sentences: string[];
+  sentence_spans: [number, number][];
+  sentence_rects: Rect[];
+};
+
 export type FsEntry = { name: string; path: string; is_dir: boolean; size: number | null; supported: boolean };
 export type FsListing = { path: string; root: string; parent: string | null; entries: FsEntry[] };
 export type FsRoot = { path: string; name: string; exists: boolean };
@@ -152,6 +165,12 @@ export const api = {
     return req<DocMeta[]>("POST", "/api/upload", fd);
   },
   doc: (id: string) => req<Doc>("GET", `/api/documents/${id}`),
+  docFileUrl: (id: string) => `/api/documents/${id}/file`,
+  locate: (id: string, block: string, claim: string) =>
+    req<Located>(
+      "GET",
+      `/api/documents/${id}/locate?block=${encodeURIComponent(block)}&claim=${encodeURIComponent(claim.slice(0, 1000))}`,
+    ),
 
   projects: () => req<ProjectSummary[]>("GET", "/api/projects"),
   project: (id: string) => req<Project>("GET", `/api/projects/${id}`),

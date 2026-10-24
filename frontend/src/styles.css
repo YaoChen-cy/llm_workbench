@@ -229,3 +229,39 @@ code { background: var(--code); padding: 1px 5px; border-radius: 4px; font-size:
 .upload-row:last-child { border-bottom: 0; }
 .upload-row.bad { background: color-mix(in srgb, var(--error) 8%, transparent); }
 .ok { color: #18794e; }
+
+/* ---------- source panel (M2) ---------- */
+.app.with-source { grid-template-columns: 250px minmax(360px, 1fr) minmax(380px, 46%); }
+.source { border-left: 1px solid var(--border); background: var(--panel); display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+.source-pad { padding: 12px 14px; }
+.source-meta { display: flex; flex-direction: column; gap: 6px; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+.source-file { display: flex; align-items: center; gap: 8px; min-width: 0; font-weight: 550; }
+.pager { display: flex; align-items: center; gap: 8px; }
+.source-quote { padding: 10px 14px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 4px; max-height: 30%; overflow-y: auto; flex: 0 0 auto; }
+.quote-text { font-size: 13px; line-height: 1.55; }
+.quote-text mark, .text-view mark { background: var(--hl-strong); color: inherit; border-radius: 2px; padding: 0 1px; }
+.source-view { flex: 1; overflow: auto; background: var(--side); padding: 12px; min-height: 0; }
+.pdf-page { position: relative; width: 100%; margin: 0 auto; background: white; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15); }
+.pdf-page canvas { display: block; }
+.pdf-overlay { position: absolute; inset: 0; pointer-events: none; }
+.hl-block { position: absolute; background: var(--hl-soft); border-left: 3px solid var(--hl-edge); border-radius: 2px; mix-blend-mode: multiply; }
+.hl-sentence { position: absolute; background: var(--hl-strong); border-radius: 2px; mix-blend-mode: multiply; }
+.cite.static { cursor: default; margin-left: 4px; }
+.cite-click { cursor: pointer; }
+.cite-click:hover { background: var(--accent); color: var(--accent-text); }
+.text-view { background: var(--panel); border-radius: 8px; padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; font-size: 13px; line-height: 1.55; }
+.tb { position: relative; padding: 2px 6px 2px 8px; border-left: 3px solid transparent; white-space: pre-wrap; }
+.tb-table { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11.5px; overflow-x: auto; white-space: pre; }
+.tb-cited { background: var(--hl-soft); border-left-color: var(--hl-edge); border-radius: 2px; }
+.tb-id { float: right; font-size: 10px; color: var(--muted); margin-left: 8px; }
+.tb-heading { font-weight: 650; margin-top: 6px; }
+:root { --hl-soft: rgba(255, 214, 10, 0.18); --hl-strong: rgba(255, 196, 0, 0.55); --hl-edge: #f0b400; }
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { --hl-soft: rgba(255, 214, 10, 0.12); --hl-strong: rgba(255, 196, 0, 0.35); --hl-edge: #d29c00; }
+}
+@media (max-width: 760px) {
+  .app.with-source { grid-template-columns: 1fr; }
+  .source { position: fixed; inset: 0; z-index: 30; }
+}
+.pager-sep { width: 1px; height: 16px; background: var(--border); margin: 0 2px; }
+.zoom-label { min-width: 34px; text-align: center; }

@@ -138,6 +138,14 @@ def get_document(doc_id: str):
         _err(e)
 
 
+@app.get("/api/documents/{doc_id}/locate")
+def locate_citation(doc_id: str, block: str, claim: str = ""):
+    try:
+        return documents.locate(doc_id, block, claim[:1000])
+    except Exception as e:
+        _err(e)
+
+
 @app.get("/api/documents/{doc_id}/file")
 def get_document_file(doc_id: str):
     try:

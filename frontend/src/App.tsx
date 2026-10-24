@@ -18,6 +18,7 @@ import Markdown from "./Markdown";
 import NewProjectModal from "./NewProjectModal";
 import ProjectView from "./ProjectView";
 import SettingsModal from "./SettingsModal";
+import SourcePanel, { type SourceTarget } from "./SourcePanel";
 
 type Pending = { user: string; text: string; info?: ContextInfo; error?: string; started: number };
 // What the right-hand file panel adds files to.
@@ -37,6 +38,7 @@ export default function App() {
   const [input, setInput] = useState("");
   const [pending, setPending] = useState<Pending | null>(null);
   const [filesTarget, setFilesTarget] = useState<FilesTarget>(null);
+  const [source, setSource] = useState<SourceTarget | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [showNewProject, setShowNewProject] = useState(false);
   const [attaching, setAttaching] = useState(false);
@@ -88,6 +90,7 @@ export default function App() {
     setNotice("");
     setProjectNotice("");
     setFilesTarget(null);
+    setSource(null);
     if (!id) return setProject(null);
     try {
       setProject(await api.project(id));
@@ -100,6 +103,7 @@ export default function App() {
     if (pending) return;
     setChat(await api.chat(id));
     setNotice("");
+    setSource(null);
     if (filesTarget === "context") setFilesTarget(null);
   };
 
@@ -225,12 +229,19 @@ export default function App() {
     return { chatDoc, doc, block };
   };
 
+  const openSource = (cid: string, claim: string) => {
+    const { chatDoc, block } = resolve(cid);
+    if (!chatDoc || !block?.id) return;
+    setFilesTarget(null);
+    setSource({ docId: chatDoc.doc_id, label: cid, blockId: block.id, claim });
+  };
+
   const active = settings ? settings.providers[settings.active_provider] : null;
   const elapsed = pending ? Math.round((Date.now() - pending.started) / 1000) : 0;
   const showProjectHome = project && !chat;
 
   return (
-    <div className={`app ${filesTarget ? "with-files" : ""}`}>
+    <div className={`app ${source ? "with-source" : filesTarget ? "with-files" : ""}`}>
       <nav className="sidebar">
         <div className="brand">
           <span className="logo" aria-hidden />
@@ -358,7 +369,10 @@ export default function App() {
           {!showProjectHome && (
             <button
               className={`btn ${filesTarget === "chat" ? "on" : ""}`}
-              onClick={() => setFilesTarget((v) => (v === "chat" ? null : "chat"))}
+              onClick={() => {
+                setSource(null);
+                setFilesTarget((v) => (v === "chat" ? null : "chat"));
+              }}
             >
               📁 Files
             </button>
@@ -377,7 +391,10 @@ export default function App() {
               }}
               onOpenChat={openChat}
               onNewChat={newChat}
-              onAddFromFolder={() => setFilesTarget("context")}
+              onAddFromFolder={() => {
+                setSource(null);
+                setFilesTarget("context");
+              }}
               notice={projectNotice}
               onNotice={setProjectNotice}
               onDelete={async () => {
@@ -419,7 +436,11 @@ export default function App() {
                     <div className="bubble">{m.content}</div>
                   ) : (
                     <div className="answer">
-                      <Markdown text={m.content || (m.error ? "" : "_(empty answer)_")} resolve={resolve} />
+                      <Markdown
+                        text={m.content || (m.error ? "" : "_(empty answer)_")}
+                        resolve={resolve}
+                        onCite={openSource}
+                      />
                       {m.error && <div className="error small">⚠ {m.error}</div>}
                       <div className="meta small muted">
                         {m.model}
@@ -445,7 +466,7 @@ export default function App() {
                   <div className="msg assistant">
                     <div className="answer">
                       {pending.text ? (
-                        <Markdown text={pending.text} resolve={resolve} />
+                        <Markdown text={pending.text} resolve={resolve} onCite={openSource} />
                       ) : (
                         <div className="thinking muted">
                           <span className="pulse" /> Reading
@@ -547,7 +568,10 @@ export default function App() {
         {dragging && <div className="drop">Drop PDF / DOCX / TXT / MD files to attach</div>}
       </main>
 
-      {filesTarget && (
+      {source && (
+        <SourcePanel target={source} doc={docs[source.docId]} onClose={() => setSource(null)} />
+      )}
+      {filesTarget && !source && (
         <FilePanel
           busy={attaching}
           onAttach={onFilesPicked}

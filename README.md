@@ -22,6 +22,8 @@ python start.py        # Windows 用 py start.py
 
 **允许访问的文件夹**：Settings → Folders。文件浏览器只能读取这些文件夹（含子文件夹）。
 
+**选择项目文件夹**：New project → Browse… 的 **Locations** 列出所有盘符（含映射的网络驱动器）、OneDrive/SharePoint 同步文件夹和常用文件夹。没列出的共享文件夹，在 Folder 框里输入路径（如 `\\server\share\team` 或 `S:\Team`）再点 Browse…。
+
 ## 功能（M1）
 
 - 多会话聊天，流式输出，可中途 Stop（已生成的部分会保留）
@@ -30,9 +32,25 @@ python start.py        # Windows 用 py start.py
 - 回答中的引用 `[D1-p2-13]` 显示为 `D1 · p.2` 标签，悬停可看文件名、页码和原文，点击打开来源；模型编造的 ID 显示为红色 `D1 · ?`
 - 文档超出上下文预算时，自动保留和问题最相关的段落，回答下方会注明“documents trimmed”
 
+## 知识库：从样本学习 summary 格式
+
+项目页的 **Knowledge base** 卡片：
+
+1. **Add example…**：上传源文档（PDF/Word/TXT/MD，可多个）和对应的**期望 summary**（Word/PDF/TXT/MD，或直接粘贴）。Word summary 的标题、项目符号和粗体会保留，导入后可以检查和修改文字。
+2. **Learn from examples**：每个样本调用一次 LLM，对比源文档和 summary（结构、取哪些信息、长度、语气、必需信息），再调用一次合并成 **Summary profile**，并给出可以加进 instructions 的建议。字数、要点数、粗体数由代码统计，不靠模型估计。
+3. **审阅并确认**：profile 可以直接修改；勾选后，建议会追加到项目 instructions。确认后保存为新版本（旧版本保留在 `profile.json` 的 history 里）。
+
+确认后的 profile 和最近一个样本 summary（只作格式参考）会加进这个项目**每个对话**的 system prompt：summary 按 profile 的结构、长度、语气写；profile 中 "Required information" 在文档里找不到时，模型会先问你。
+
+在项目对话里，回答下方的 **Add to knowledge base** 菜单：
+- **Save as example summary**：把这个回答保存为样本，对话里 attach 的文件和回答引用到的项目 context 文档一起作为它的源文档；保存后可以直接重新学习
+- **Use as summary profile…**：把这个回答（比如你和模型讨论确定的 summary 结构）编辑后直接作为 profile
+
+数据保存在 `<项目文件夹>/.workbench/knowledge/`（`examples/` 和 `profile.json`），随项目文件夹一起复制。
+
 ## 生成文件
 
-模型可以直接生成文件：在对话里说"保存成 Word 文件"、"导出成 CSV"等即可。回答中的文件会显示为卡片，包含文件名、类型、预览，以及两个按钮：
+模型可以直接生成文件：在对话里说"保存成 Word 文件"、"导出成 CSV"等即可；要求起草 summary 时默认生成 Word 文件。回答里先显示文件的文字内容（带可点击的引用），最后是文件卡片，包含文件名、类型、"Preview as saved"（保存后的样子，含 Sources 列表），以及两个按钮：
 
 - **Save to project folder**（仅项目内）：保存到项目文件夹（可以有子目录，如 `drafts/summary.docx`），不能写到项目文件夹之外；同名文件会先询问是否覆盖
 - **Download**：通过浏览器下载
@@ -80,6 +98,7 @@ backend/
   chats.py       会话存储、prompt 拼装、超长文档的段落筛选
   projects.py    项目：instructions、context、文件夹沙盒、输出写入
   outputs.py     模型生成的文件：解析 <file> 块、Markdown 转 Word
+  knowledge.py   知识库：样本、从样本学习 summary profile、加进 prompt
 data/            运行时数据（git-ignored）：docs/ 解析缓存，chats/ 会话，uploads/ 上传文件
 cip/             原 CIP 月度总结流程
 ```

@@ -14,7 +14,7 @@ from urllib.parse import quote
 
 from nicegui import events, ui
 
-from . import chats, documents, llm, outputs, projects, settings
+from . import chats, documents, knowledge, llm, outputs, projects, settings
 from . import files as fs
 
 # ---------------------------------------------------------------- styling
@@ -46,6 +46,14 @@ body { background: var(--wb-bg); color: var(--wb-text); font-size: 14px; }
 .chip { display: inline-flex; align-items: center; gap: 4px; font-size: 12.5px; background: var(--wb-panel); border: 1px solid var(--wb-border); border-radius: 14px; padding: 1px 4px 1px 10px; }
 .chip b { color: var(--wb-accent); }
 .answer .nicegui-markdown p { margin: 0 0 10px; }
+.wb-resizer { position: absolute; top: 0; right: 0; width: 10px; height: 100%; cursor: col-resize; z-index: 3000; }
+.wb-resizer-right { left: 0; right: auto; }
+.wb-resizer:hover, body.wb-resizing .wb-resizer { background: var(--wb-accent); opacity: .35; }
+body.wb-resizing, body.wb-resizing * { cursor: col-resize !important; user-select: none !important; }
+.q-drawer__content { position: relative; }
+.user-msg .msg-actions { opacity: 0; transition: opacity .15s; }
+.user-msg:hover .msg-actions, .user-msg:focus-within .msg-actions { opacity: 1; }
+.answer .file-text { border-left: 3px solid var(--wb-accent-soft); padding-left: 12px; }
 .answer .nicegui-markdown table { border-collapse: collapse; }
 .answer .nicegui-markdown th, .answer .nicegui-markdown td { border: 1px solid var(--wb-border); padding: 3px 8px; }
 .cite { display: inline-block; font-size: 11px; font-weight: 600; line-height: 1.5; padding: 0 5px; margin: 0 1px; border-radius: 4px;
@@ -81,12 +89,65 @@ document.addEventListener('click', (e) => {
 });
 </script>"""
 
+# Dragging the border of the sidebar or the right panel sends "resize_drawer" events to Python, which sets
+# the drawer width (Quasar then re-lays out the chat column). Widths are remembered in this browser.
+RESIZE_SCRIPT = """<script>
+(() => {
+  let drag = null, frame = 0;
+  const key = (side) => 'wb-width-' + side;
+  document.addEventListener('mousedown', (e) => {
+    const h = e.target.closest('.wb-resizer');
+    if (!h) return;
+    const drawer = h.closest('.q-drawer');
+    drag = {side: h.dataset.side, x: e.clientX, w: drawer.offsetWidth};
+    document.body.classList.add('wb-resizing');
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', (e) => {
+    if (!drag) return;
+    const dx = e.clientX - drag.x;
+    const w = Math.round(drag.side === 'left' ? drag.w + dx : drag.w - dx);
+    cancelAnimationFrame(frame);
+    frame = requestAnimationFrame(() => { drag.last = w; emitEvent('resize_drawer', {side: drag.side, width: w}); });
+  });
+  document.addEventListener('mouseup', () => {
+    if (!drag) return;
+    try { if (drag.last) localStorage.setItem(key(drag.side), drag.last); } catch (_) {}
+    drag = null;
+    document.body.classList.remove('wb-resizing');
+  });
+  window.addEventListener('load', () => setTimeout(() => {
+    for (const side of ['left', 'right']) {
+      let w = null;
+      try { w = localStorage.getItem(key(side)); } catch (_) {}
+      if (w) emitEvent('resize_drawer', {side: side, width: +w, initial: true});
+    }
+  }, 300));
+})();
+</script>"""
+
 INSTRUCTIONS_HINT = """Describe the task the assistant should perform in this project, e.g.
 
 Draft a credit summary for each memo I attach.
 - Two sections: "Situation Recap" and "Recent Development", 2-4 bullet points each.
 - Bold the key figures. Use $mm for amounts.
 - Only use facts from the attached memo; ask me if something important is missing."""
+
+PROFILE_TEMPLATE = """## Summary profile
+### Structure
+- 
+### Required information
+- 
+### Content selection
+- 
+### Length
+- 
+### Tone and phrasing
+- 
+### Formatting
+- 
+### Template
+"""
 
 # ---------------------------------------------------------------- file info helpers
 
@@ -186,16 +247,34 @@ def render_answer(text: str, resolve) -> str:
     return CITE_GROUP.sub(chip, text)
 
 
+TEXT_FILES = (".md", ".docx", ".txt")
+
+
+def is_text_file(path: str) -> bool:
+    return Path(path).suffix.lower() in TEXT_FILES
+
+
 def streaming_view(text: str) -> str:
-    """While an answer streams, show file blocks as one-line placeholders instead of raw tags."""
+    """While an answer streams: document files (.docx/.md/.txt) show their text inline, other files a placeholder."""
     out = []
     for part in outputs.split_answer(text):
         if part["kind"] == "text":
             out.append(part["text"])
+        elif is_text_file(part["path"]):
+            out.append("\n\n" + part["content"] + ("" if part["complete"] else f"\n\n> 📄 writing **{part['path']}**…") + "\n\n")
         else:
             state = "ready" if part["complete"] else "writing…"
             out.append(f"\n\n> 📄 **{part['path']}** — {state} ({len(part['content']):,} characters)\n\n")
     return "".join(out)
+
+
+def answer_summary_text(content: str) -> str:
+    """The summary in an answer: the first document file's content, else the answer text without file blocks."""
+    parts = outputs.split_answer(content)
+    for part in parts:
+        if part["kind"] == "file" and is_text_file(part["path"]):
+            return part["content"].strip()
+    return "".join(p["text"] for p in parts if p["kind"] == "text").strip()
 
 
 def marked(text: str, spans: list) -> str:
@@ -250,6 +329,19 @@ class Workbench:
         self.task: asyncio.Task | None = None
         self.busy = False
         self.docs: dict[str, dict] = {}
+        self.editing: int | None = None         # index of the user message being edited
+        self.left_width = 260                   # drawer widths in px, changed by dragging their borders
+        self.right_widths = {"source": 560, "files": 320}
+
+    # ---------- feedback that survives refreshes
+
+    def notify(self, *args, **kwargs):
+        with self.root:
+            ui.notify(*args, **kwargs)
+
+    def download(self, *args, **kwargs):
+        with self.root:
+            ui.download(*args, **kwargs)
 
     # ---------- data helpers
 
@@ -284,16 +376,22 @@ class Workbench:
         self.root = ui.element("div")
         ui.add_css(CSS)
         ui.add_body_html(CITE_SCRIPT)
+        ui.add_body_html(RESIZE_SCRIPT)
+        ui.on("resize_drawer", self.on_resize, throttle=0.03)
         ui.page_title("LLM Workbench")
         ui.dark_mode(None)                      # follow the system setting
         ui.on("cite", lambda e: self.open_source(e.args.get("id", ""), e.args.get("claim", "")))
 
-        with ui.left_drawer(value=True, fixed=True).props("width=260 bordered breakpoint=700").classes("p-3"):
+        self.left = ui.left_drawer(value=True, fixed=True).props(f"width={self.left_width} bordered breakpoint=700") \
+            .classes("p-3")
+        with self.left:
+            ui.element("div").classes("wb-resizer").props('data-side=left').tooltip("Drag to resize")
             self.sidebar()
         with ui.header().classes("wb-header items-center gap-3 px-4 py-2"):
             self.topbar()
         self.drawer = ui.right_drawer(value=False, fixed=True).props("bordered breakpoint=700").classes("rightpanel p-0")
         with self.drawer:
+            ui.element("div").classes("wb-resizer wb-resizer-right").props('data-side=right').tooltip("Drag to resize")
             self.right_panel()
         self.footer = ui.footer().classes("wb-footer px-4 pb-3 pt-1")
         with self.footer:
@@ -379,7 +477,7 @@ class Workbench:
         if self.project and not self.chat:
             self.project_view()
             return
-        self.msg_col = ui.column().classes("w-full max-w-[820px] mx-auto gap-4 pb-4")
+        self.msg_col = ui.column().classes("w-full max-w-[1100px] mx-auto gap-4 pb-4")
         with self.msg_col:
             if not self.chat or not self.chat["messages"]:
                 with ui.column().classes("w-full items-center text-center mt-[12vh] gap-2"):
@@ -393,20 +491,35 @@ class Workbench:
                         ui.label("Open Files to pick documents from your allowed folders, or use the 📎 button. "
                                  "Answers cite their sources — click a citation to see it highlighted in the original. "
                                  "For repeated tasks, create a project.").classes("muted max-w-[540px]")
-            for m in (self.chat["messages"] if self.chat else []):
-                self.render_message(m)
+            for i, m in enumerate(self.chat["messages"] if self.chat else []):
+                self.render_message(m, i)
 
-    def render_message(self, m: dict):
+    def render_message(self, m: dict, index: int | None = None):
         if m["role"] == "user":
-            with ui.row().classes("w-full justify-end"):
+            if index is not None and index == self.editing:
+                self.edit_box(m, index)
+                return
+            with ui.column().classes("w-full items-end gap-0 user-msg"):
                 ui.label(m["content"]).classes("bubble")
+                with ui.row().classes("msg-actions gap-0"):
+                    ui.button(icon="content_copy", on_click=lambda m=m: self.copy(m["content"])) \
+                        .props("flat dense round size=sm").tooltip("Copy")
+                    if index is not None:
+                        ui.button(icon="edit", on_click=lambda i=index: self.start_edit(i)) \
+                            .props("flat dense round size=sm").tooltip("Edit and resend from here") \
+                            .set_enabled(not self.pending)
             return
         with ui.column().classes("answer w-full gap-1"):
-            for part in outputs.split_answer(m["content"]):
-                if part["kind"] == "text":
-                    if part["text"].strip():
-                        ui.markdown(render_answer(part["text"], self.resolve))
-                else:
+            parts = outputs.split_answer(m["content"])
+            # Prose and the text of document files (with clickable citations) first …
+            for part in parts:
+                text = part["text"] if part["kind"] == "text" else part["content"] if is_text_file(part["path"]) else ""
+                if text.strip():
+                    ui.markdown(render_answer(text, self.resolve)).classes(
+                        "file-text" if part["kind"] == "file" else "")
+            # … then one download / preview box per file at the end.
+            for part in parts:
+                if part["kind"] == "file":
                     self.file_card(part)
             if not m["content"] and not m.get("error"):
                 ui.label("(empty answer)").classes("muted italic")
@@ -414,11 +527,20 @@ class Workbench:
                 ui.label(f"⚠ {m['error']}").classes("err text-xs")
             with ui.row().classes("items-center gap-2 text-xs muted"):
                 ui.label(m.get("model", ""))
+                if m["content"]:
+                    ui.button(icon="content_copy", on_click=lambda m=m: self.copy(m["content"])) \
+                        .props("flat dense round size=xs").tooltip("Copy answer (Markdown)")
                 if (m.get("context") or {}).get("truncated"):
                     ui.label("· documents trimmed to fit context")
                 if self.project and m["content"]:
                     ui.button("Save to folder", on_click=lambda m=m: self.save_to_folder(m)) \
                         .props("flat dense no-caps size=sm color=primary")
+                    with ui.dropdown_button("Add to knowledge base", icon="school", auto_close=True) \
+                            .props("flat dense no-caps size=sm color=primary"):
+                        ui.item("Save as example summary", on_click=lambda m=m: self.save_as_example(m)) \
+                            .tooltip("Keep this answer (and the chat's documents) as an example the profile is learned from")
+                        ui.item("Use as summary profile…", on_click=lambda m=m: self.use_as_profile(m)) \
+                            .tooltip("Use this answer, e.g. a summary structure you agreed on, as the project's profile")
 
     def with_sources(self, path: str, content: str) -> str:
         """Replace citation IDs with [1], [2]… and append a Sources list, so a saved file stays traceable
@@ -468,14 +590,17 @@ class Workbench:
                               on_click=lambda: self.save_file(path, self.with_sources(path, content))) \
                         .props("unelevated dense no-caps size=sm")
                 ui.button("Download", icon="download",
-                          on_click=lambda: ui.download(outputs.to_bytes(path, self.with_sources(path, content)),
+                          on_click=lambda: self.download(outputs.to_bytes(path, self.with_sources(path, content)),
                                                        Path(path).name)) \
                     .props("outline dense no-caps size=sm")
                 if CITE_GROUP.search(content):
                     ui.label("Citations become numbered references with a Sources list.").classes("muted text-xs")
-            with ui.expansion("Preview").classes("w-full text-sm").props("dense"):
+            with ui.expansion("Preview as saved").classes("w-full text-sm").props("dense"):
                 if Path(path).suffix.lower() in (".md", ".docx"):
-                    ui.markdown(content)
+                    saved = self.with_sources(path, content)
+                    body, sep, sources = saved.partition("\n## Sources\n")
+                    # File names like Harborline_Home_Furnishings.pdf would render "_Home_" in italics.
+                    ui.markdown(body + sep + sources.replace("_", "\\_"))
                 else:
                     ui.code(content, language=None).classes("w-full text-xs")
 
@@ -487,16 +612,61 @@ class Workbench:
                 return
             dest = projects.write_output(self.project["id"], path, content, overwrite=True)
         except Exception as e:
-            ui.notify(str(e), type="negative")
+            self.notify(str(e), type="negative")
             return
-        ui.notify(f"Saved {Path(dest).name}", type="positive")
+        self.notify(f"Saved {Path(dest).name}", type="positive")
         self.set_notice(f"✓ Saved to {dest}")
+
+    # ---------- copy / edit sent messages
+
+    def copy(self, text: str):
+        with self.root:
+            ui.clipboard.write(text)
+        self.notify("Copied", position="bottom", timeout=1200)
+
+    def start_edit(self, index: int):
+        if self.pending:
+            return
+        self.editing = index
+        self.main.refresh()
+        self.client.run_javascript("document.querySelector('.edit-box textarea')?.focus()")
+
+    def edit_box(self, m: dict, index: int):
+        later = len(self.chat["messages"]) - index - 1
+        with ui.column().classes("w-full items-end gap-1 edit-box"):
+            box = ui.textarea(value=m["content"]).classes("w-full max-w-[85%]") \
+                .props("outlined autogrow input-style='max-height:300px'")
+            box.on("keydown.enter.exact.prevent", lambda: self.resend(index, box.value))
+            with ui.row().classes("items-center gap-2"):
+                if later:
+                    ui.label(f"Sending replaces the {later} message{'s' if later != 1 else ''} after this one.") \
+                        .classes("muted text-xs")
+                ui.button("Cancel", on_click=self.cancel_edit).props("flat dense no-caps")
+                ui.button("Send", on_click=lambda: self.resend(index, box.value)).props("unelevated dense no-caps")
+
+    def cancel_edit(self):
+        self.editing = None
+        self.main.refresh()
+
+    async def resend(self, index: int, text: str):
+        """Continue the conversation from an earlier message: it and everything after it are replaced
+        (kept in chat["earlier_versions"], not deleted)."""
+        text = (text or "").strip()
+        if not text or self.pending:
+            return
+        chat = chats.get(self.chat["id"])
+        removed = chat["messages"][index:]
+        chat.setdefault("earlier_versions", []).append({"at": time.time(), "messages": removed})
+        chat["messages"] = chat["messages"][:index]
+        chats.save(chat)
+        self.chat, self.editing = chat, None
+        await self.send(text)
 
     # ---------- composer
 
     @ui.refreshable
     def composer(self):
-        with ui.column().classes("w-full max-w-[820px] mx-auto gap-2"):
+        with ui.column().classes("w-full max-w-[1100px] mx-auto gap-2"):
             if self.notice:
                 with ui.row().classes("notice items-start justify-between no-wrap"):
                     ui.label(self.notice).classes("whitespace-pre-wrap")
@@ -544,11 +714,28 @@ class Workbench:
         if self.right in ("files", "context"):
             self.fs_selected = set()
             self.fs_path = self.project["folder"] if self.project else None
-        width = 520 if self.right == "source" else 320
-        self.drawer.props(f"width={width}")
+        self.drawer.props(f"width={self.right_width()}")
         self.drawer.set_value(self.right is not None)
         self.right_panel.refresh()
         self.topbar.refresh()
+
+    def right_width(self) -> int:
+        return self.right_widths["source" if self.right == "source" else "files"]
+
+    def on_resize(self, e):
+        """Drag handle on a drawer border: set its width (clamped so the chat column stays usable)."""
+        side, width = e.args.get("side"), int(e.args.get("width") or 0)
+        if side == "left":
+            self.left_width = max(180, min(520, width))
+            self.left.props(f"width={self.left_width}")
+        elif side == "right":
+            width = max(260, min(1100, width))
+            if e.args.get("initial"):
+                self.right_widths["source"] = width     # remembered width applies to the source panel
+            else:
+                self.right_widths["source" if self.right == "source" else "files"] = width
+            if self.right:
+                self.drawer.props(f"width={self.right_width()}")
 
     @ui.refreshable
     def right_panel(self):
@@ -703,29 +890,24 @@ class Workbench:
                             ui.button("Back to cited page", on_click=lambda: self.source_page(0)) \
                                 .props("flat dense no-caps size=sm color=primary")
 
-            with ui.column().classes("w-full px-4 py-2 gap-1 quote").style(
-                    "border-bottom:1px solid var(--wb-border);max-height:30%;overflow-y:auto;flex:0 0 auto"):
-                b = loc["block"]
-                where = f"page {b['page']}" if is_pdf else f"block {b['id']}"
-                cont = " (continues on next page)" if len({r[0] for r in b["rects"]}) > 1 else ""
-                ui.label(f"{b['heading'] + ' · ' if b['heading'] else ''}{where}{cont}").classes("muted text-xs")
-                ui.html(marked(b["text"], loc["sentence_spans"])).classes("text-[13px] leading-relaxed")
-                if s["claim"] and not loc["sentences"] and b["type"] == "paragraph":
-                    ui.label("No single sentence matched the claim, so the whole paragraph is highlighted.") \
-                        .classes("muted text-xs")
-
+            b = loc["block"]
             if is_pdf:
-                area = ui.scroll_area().classes("grow w-full pdf-scroll")
-                with area:
-                    url = (f"/api/documents/{s['doc_id']}/page/{s['page']}.png?zoom={min(4, 1.5 * s['zoom'])}"
+                with ui.scroll_area().classes("grow w-full pdf-scroll"):
+                    url = (f"/api/documents/{s['doc_id']}/page/{s['page']}.png?zoom={min(4, 2 * s['zoom'])}"
                            f"&block={quote(s['block_id'])}&claim={quote(s['claim'][:800])}")
-                    img = ui.image(url).classes("shadow").style(f"width:{int(100 * s['zoom'])}%;max-width:none")
+                    ui.image(url).classes("shadow").style(f"width:{int(100 * s['zoom'])}%;max-width:none")
                 if s["page"] == b["page"]:
                     ys = [r[2] for r in (loc["sentence_rects"] or b["rects"]) if r[0] == s["page"] - 1]
                     size = loc["page_sizes"].get(str(s["page"] - 1)) or loc["page_sizes"].get(s["page"] - 1)
                     if ys and size:
-                        frac = max(0.0, min(1.0, (min(ys) - 120) / size[1]))
-                        img.on("load", lambda: area.scroll_to(percent=frac))
+                        # Scroll so the highlight sits near the top, once the page image has loaded (done in the
+                        # browser: the image's load event does not reliably reach Python).
+                        frac = max(0.0, min(ys) / size[1])
+                        js = ("(() => { const c = document.querySelector('.rightpanel .pdf-scroll .q-scrollarea__container');"
+                              " const img = c && c.querySelector('img'); if (!img) return;"
+                              f" const go = () => {{ c.scrollTop = Math.max(0, {frac:.4f} * img.offsetHeight - 60); }};"
+                              " if (img.complete && img.naturalHeight) go(); else img.addEventListener('load', go, {once: true}); })()")
+                        ui.timer(0.15, lambda: self.client.run_javascript(js), once=True)
             else:
                 doc = self.doc(s["doc_id"])
                 parts = []
@@ -763,10 +945,11 @@ class Workbench:
         if self.pending:
             return
         self.chat, self.notice, self.project_notice = None, "", ""
+        self.editing = None
         try:
             self.project = projects.get(pid) if pid else None
         except FileNotFoundError as e:
-            ui.notify(str(e), type="negative")
+            self.notify(str(e), type="negative")
             self.project = None
         if self.right:
             self.toggle_right(None)
@@ -775,7 +958,7 @@ class Workbench:
     def open_chat(self, cid: str):
         if self.pending:
             return
-        self.chat, self.notice = chats.get(cid), ""
+        self.chat, self.notice, self.editing = chats.get(cid), "", None
         if self.right in ("context", "source"):
             self.toggle_right(None)
         self.refresh_all()
@@ -783,7 +966,7 @@ class Workbench:
     def new_chat(self):
         if self.pending:
             return
-        self.notice = ""
+        self.notice, self.editing = "", None
         self.chat = chats.create(self.project["id"]) if self.project else None
         if self.right == "context":
             self.toggle_right(None)
@@ -852,10 +1035,13 @@ class Workbench:
 
     # ---------- sending
 
-    async def send(self):
-        text = (self.input.value or "").strip()
+    async def send(self, text: str | None = None):
+        from_input = text is None
+        text = ((self.input.value or "") if from_input else text).strip()
         if not text or self.pending:
             return
+        if from_input:
+            self.input.value = ""
         chat = self.ensure_chat()
         p = settings.provider()
         project = projects.get(chat["project_id"]) if chat.get("project_id") else None
@@ -937,7 +1123,7 @@ class Workbench:
                 return
             path = projects.write_output(self.project["id"], name, m["content"], overwrite=True)
         except Exception as e:
-            ui.notify(str(e), type="negative")
+            self.notify(str(e), type="negative")
             return
         self.set_notice(f"Saved to {path}")
 
@@ -996,6 +1182,8 @@ class Workbench:
                         ui.button(icon="close", on_click=lambda: self.set_project_notice("")) \
                             .props("flat dense round size=xs")
 
+            self.knowledge_card(p)
+
             with ui.column().classes("card gap-1"):
                 with ui.row().classes("w-full items-center justify-between"):
                     ui.label("Chats").classes("font-semibold text-[15px]")
@@ -1024,7 +1212,7 @@ class Workbench:
 
     def save_instructions(self, text: str):
         self.project = projects.update(self.project["id"], instructions=text)
-        ui.notify("Instructions saved", type="positive")
+        self.notify("Instructions saved", type="positive")
 
     async def remove_context(self, c: dict):
         msg = (f"Remove {c['name']} from context? The file stays in the folder." if c["source"] == "folder"
@@ -1072,6 +1260,231 @@ class Workbench:
             projects.forget(p["id"])
             self.open_project(None)
 
+    # ---------- knowledge base (examples + summary profile)
+
+    def knowledge_card(self, p: dict):
+        try:
+            examples = knowledge.list_examples(p["id"])
+            prof = knowledge.get_profile(p)
+        except Exception as e:
+            ui.label(f"Knowledge base unavailable: {e}").classes("err text-xs")
+            return
+        with ui.column().classes("card gap-2"):
+            with ui.row().classes("w-full items-baseline justify-between"):
+                ui.label("Knowledge base").classes("font-semibold text-[15px]")
+                ui.label("Examples teach the assistant your summary format").classes("muted text-xs")
+
+            ui.label("Examples (source document → expected summary)").classes("text-sm font-medium")
+            if not examples:
+                ui.label("No examples yet. Add a source PDF with the summary you expect, or save a good answer "
+                         "from a chat with Add to knowledge base.").classes("muted text-xs")
+            for ex in examples:
+                with ui.row().classes("w-full items-center gap-2 no-wrap py-1").style("border-bottom:1px solid var(--wb-border)"):
+                    ui.icon("school", size="xs").classes("muted")
+                    ui.label(ex["name"]).classes("ellipsis1 font-medium")
+                    ui.label(("← " + ", ".join(ex["sources"])) if ex["sources"] else "(no source document)") \
+                        .classes("muted text-xs ellipsis1 grow")
+                    ui.badge("from chat" if ex["origin"] == "chat" else "uploaded").props("outline")
+                    ui.button(icon="visibility", on_click=lambda ex=ex: self.view_example(ex)) \
+                        .props("flat dense round size=xs").tooltip("View the expected summary")
+                    ui.button(icon="close", on_click=lambda ex=ex: self.remove_example(ex)) \
+                        .props("flat dense round size=xs").tooltip("Remove example")
+            with ui.row().classes("gap-2"):
+                ui.button("Add example…", icon="add", on_click=self.add_example_dialog).props("outline no-caps")
+                ui.button("Learn from examples", icon="auto_awesome", on_click=self.learn_flow) \
+                    .props("unelevated no-caps").set_enabled(bool(examples))
+
+            ui.separator()
+            if prof:
+                with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                    ui.icon("check_circle", color="positive", size="sm")
+                    ui.label(f"Summary profile v{prof['version']} · confirmed "
+                             f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(prof['updated']))} · used in every chat "
+                             "in this project").classes("text-sm grow")
+                    ui.button("View / edit", on_click=lambda: self.profile_editor(prof["text"], prof.get("stats"), "",
+                                                                                 "edited")).props("outline dense no-caps size=sm")
+                    ui.button(icon="delete", on_click=self.remove_profile).props("flat dense round size=sm") \
+                        .tooltip("Stop using the profile")
+                with ui.expansion("Show profile").classes("w-full text-sm").props("dense"):
+                    ui.markdown(prof["text"])
+            else:
+                with ui.row().classes("w-full items-center gap-2"):
+                    ui.icon("radio_button_unchecked", size="sm").classes("muted")
+                    ui.label("No summary profile yet. Learn one from the examples, or write it yourself.") \
+                        .classes("muted text-sm grow")
+                    ui.button("Write manually", on_click=lambda: self.profile_editor(PROFILE_TEMPLATE, None, "", "manual")) \
+                        .props("flat dense no-caps size=sm color=primary")
+
+    async def view_example(self, ex: dict):
+        with self.root, ui.dialog() as dialog, ui.card().classes("w-[680px] max-w-full"):
+            with ui.row().classes("w-full items-center justify-between"):
+                ui.label(ex["name"]).classes("font-semibold")
+                ui.button(icon="close", on_click=dialog.close).props("flat dense round size=sm")
+            ui.label("Sources: " + (", ".join(ex["sources"]) or "none")).classes("muted text-xs")
+            with ui.scroll_area().classes("w-full h-[60vh]"):
+                ui.markdown(ex["summary"])
+        dialog.on("hide", dialog.delete)
+        dialog.open()
+
+    async def remove_example(self, ex: dict):
+        if await self.confirm(f"Remove the example \"{ex['name']}\"? Its copied files in .workbench/knowledge are "
+                              "deleted. The current profile is not changed until you learn again.", "Remove"):
+            knowledge.remove_example(self.project["id"], ex["id"])
+            self.main.refresh()
+
+    async def remove_profile(self):
+        if await self.confirm("Stop using the summary profile in this project's chats? (It is deleted; examples are kept.)",
+                              "Remove"):
+            knowledge.clear_profile(self.project["id"])
+            self.main.refresh()
+
+    async def add_example_dialog(self):
+        state = {"sources": []}
+        with self.root, ui.dialog().props("persistent") as dialog, ui.card().classes("w-[680px] max-w-full gap-3"):
+            with ui.row().classes("w-full items-center justify-between"):
+                ui.label("Add example").classes("font-semibold text-base")
+                ui.button(icon="close", on_click=lambda: dialog.submit(None)).props("flat dense round size=sm")
+            ui.label("An example is a source document plus the summary you expect for it. The assistant learns the "
+                     "structure, length, tone and what information to pick from these pairs.").classes("muted text-xs")
+            name = ui.input("Name", placeholder="e.g. Harborline Oct 2026").classes("w-full").props("outlined dense")
+
+            ui.label("1. Source document(s)").classes("text-sm font-medium")
+
+            @ui.refreshable
+            def source_list():
+                for i, (n, data) in enumerate(state["sources"]):
+                    with ui.row().classes("w-full items-center gap-3 px-2 no-wrap"):
+                        type_badge(n)
+                        ui.label(n).classes("ellipsis1 grow")
+                        ui.label(file_size(len(data))).classes("muted text-xs")
+                        ui.button(icon="close", on_click=lambda i=i: (state["sources"].pop(i), source_list.refresh())) \
+                            .props("flat dense round size=xs")
+
+            def on_sources(e: events.MultiUploadEventArguments):
+                e.sender.run_method("reset")
+                state["sources"] += [(n, c.read()) for n, c in zip(e.names, e.contents)]
+                if not name.value:
+                    name.value = Path(e.names[0]).stem
+                source_list.refresh()
+
+            up_src = ui.upload(multiple=True, auto_upload=True, on_multi_upload=on_sources, on_rejected=rejected) \
+                .props(f'accept="{ACCEPT}"').classes("hidden")
+            ui.button("Upload source document(s)…", icon="upload_file", on_click=lambda: up_src.run_method("pickFiles")) \
+                .props("outline no-caps")
+            source_list()
+
+            ui.label("2. Expected summary").classes("text-sm font-medium")
+            summary = ui.textarea(placeholder="Upload the summary file (Word, PDF, Text, Markdown) or paste it here. "
+                                  "Bullets, headings and **bold** are kept.") \
+                .classes("w-full").props("outlined autogrow input-style='min-height:180px'")
+            summary_note = ui.label().classes("muted text-xs")
+
+            def on_summary(e: events.UploadEventArguments):
+                e.sender.run_method("reset")
+                try:
+                    summary.value = knowledge.summary_markdown(e.name, e.content.read())
+                    summary_note.set_text(f"✓ Read {e.name} ({file_type(e.name)}). Check the text above; you can edit it.")
+                except Exception as ex:
+                    summary_note.set_text(f"✗ {ex}")
+
+            up_sum = ui.upload(auto_upload=True, on_upload=on_summary, on_rejected=rejected) \
+                .props('accept=".docx,.md,.txt,.pdf"').classes("hidden")
+            ui.button("Upload summary file…", icon="description", on_click=lambda: up_sum.run_method("pickFiles")) \
+                .props("outline no-caps")
+            error = ui.label().classes("err text-xs")
+            with ui.row().classes("w-full justify-end"):
+                ui.button("Cancel", on_click=lambda: dialog.submit(None)).props("flat no-caps")
+                add_btn = ui.button("Add example", on_click=lambda: dialog.submit("add")).props("unelevated no-caps")
+            add_btn.bind_enabled_from(summary, "value", backward=lambda v: bool((v or "").strip()))
+
+        while True:
+            if await dialog != "add":
+                dialog.delete()
+                return
+            try:
+                knowledge.add_example(self.project["id"], name.value or "", state["sources"], summary.value)
+                break
+            except Exception as e:
+                error.set_text(str(e))
+        dialog.delete()
+        self.notify("Example added", type="positive")
+        self.main.refresh()
+
+    async def save_as_example(self, m: dict):
+        text = answer_summary_text(m["content"])
+        if not text:
+            self.notify("This answer has no text to save.", type="warning")
+            return
+        with self.root:
+            name = await ask_text("Save this answer as an example summary. The documents attached to this chat are "
+                                  "saved with it as its sources.\nName:", self.chat["title"][:60], "Save example")
+        if not name:
+            return
+        knowledge.add_example_from_chat(self.project["id"], self.chat, text, name)
+        n = len(knowledge.list_examples(self.project["id"]))
+        if await self.confirm(f"Saved as example ({n} in this project). Update the summary profile from all "
+                              "examples now?", "Learn now"):
+            await self.learn_flow()
+
+    async def use_as_profile(self, m: dict):
+        text = answer_summary_text(m["content"])
+        await self.profile_editor(text, None, "", "chat")
+
+    async def learn_flow(self):
+        pid = self.project["id"]
+        with self.root, ui.dialog().props("persistent") as dlg, ui.card().classes("w-[460px] max-w-full"):
+            ui.label("Learning from examples").classes("font-semibold")
+            with ui.row().classes("items-center gap-3 no-wrap"):
+                ui.spinner(size="md")
+                msg = ui.label("Starting…").classes("text-sm")
+            ui.label("One LLM call per example plus one to combine them; this can take a few minutes.") \
+                .classes("muted text-xs")
+        dlg.open()
+        try:
+            draft = await knowledge.learn(pid, settings.provider(), progress=msg.set_text)
+        except Exception as e:
+            dlg.close()
+            dlg.delete()
+            self.notify(f"Learning failed: {e}", type="negative", multi_line=True, timeout=0, close_button=True)
+            return
+        dlg.close()
+        dlg.delete()
+        await self.profile_editor(draft["profile"], draft["stats"], draft["suggestions"], "learned")
+
+    async def profile_editor(self, text: str, stats: dict | None, suggestions: str, source: str):
+        pid = self.project["id"]
+        titles = {"learned": "Review the learned summary profile", "edited": "Edit the summary profile",
+                  "chat": "Use this answer as the summary profile", "manual": "Write the summary profile"}
+        with self.root, ui.dialog().props("persistent") as dialog, ui.card().classes("w-[760px] max-w-full gap-2"):
+            ui.label(titles.get(source, "Summary profile")).classes("font-semibold text-base")
+            ui.label("Edit anything that is wrong, then confirm. The confirmed profile is added to every chat in this "
+                     "project: summaries follow its structure, length and tone, and the assistant asks you when "
+                     "'Required information' is missing.").classes("muted text-xs")
+            if stats:
+                ui.label("Measured from the examples: " + knowledge.stats_text(stats).replace("\n- ", " · ").lstrip("- ")) \
+                    .classes("muted text-xs")
+            editor = ui.textarea(value=text).classes("w-full").props(
+                "outlined autogrow input-style='min-height:320px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px'")
+            append = None
+            if suggestions.strip():
+                ui.label("Suggested additions to the project instructions").classes("text-sm font-medium")
+                sugg = ui.textarea(value=suggestions).classes("w-full").props("outlined autogrow")
+                append = ui.checkbox("Append these to the project instructions", value=True).props("dense")
+            with ui.row().classes("w-full justify-end"):
+                ui.button("Cancel", on_click=lambda: dialog.submit(False)).props("flat no-caps")
+                ui.button("Confirm & save", on_click=lambda: dialog.submit(True)).props("unelevated no-caps")
+        ok = await dialog
+        dialog.delete()
+        if not ok or not (editor.value or "").strip():
+            return
+        prof = knowledge.save_profile(pid, editor.value, stats, source)
+        if append is not None and append.value and (sugg.value or "").strip():
+            instr = (self.project["instructions"].rstrip() + "\n\n" + sugg.value.strip()).strip()
+            projects.update(pid, instructions=instr)
+        self.reload_project()
+        self.main.refresh()
+        self.notify(f"Summary profile v{prof['version']} saved; new messages in this project use it.", type="positive")
+
     # ---------- new project dialog
 
     async def new_project_dialog(self):
@@ -1100,18 +1513,22 @@ class Workbench:
                         ui.label(state["error"]).classes("err text-xs p-2")
                     if not lst:
                         return
+                    at_locations = lst["path"] == lst["locations"]
                     with ui.row().classes("w-full items-center gap-1 p-2 no-wrap").style("border-bottom:1px solid var(--wb-border)"):
                         ui.button(icon="arrow_upward", on_click=lambda: browse(lst["parent"])) \
                             .props("outline dense size=sm").tooltip("Up one level").set_enabled(bool(lst["parent"]))
-                        ui.button("Home", on_click=lambda: browse(lst["home"])).props("outline dense no-caps size=sm")
-                        ui.label(lst["path"]).classes("text-xs muted ellipsis1").style("direction:rtl;text-align:left")
+                        ui.button("Locations", icon="storage", on_click=lambda: browse(lst["locations"])) \
+                            .props("outline dense no-caps size=sm").tooltip("Drives, network drives and common folders")
+                        ui.label("Drives, network drives and common folders" if at_locations else lst["path"]) \
+                            .classes("text-xs muted ellipsis1").style("direction:rtl;text-align:left")
                     with ui.scroll_area().classes("w-full h-56"):
                         if not lst["dirs"] and not lst["files"]:
                             ui.label("This folder is empty.").classes("muted text-xs p-2")
+                        icons = {"home": "home", "drive": "storage", "network": "lan", "cloud": "cloud", "folder": "folder"}
                         for d in lst["dirs"]:
                             with ui.element("div").classes("fs-row click").on("click", lambda p=d["path"]: browse(p)) \
                                     .on("dblclick", lambda p=d["path"]: pick(p)):
-                                ui.icon("folder", size="xs").classes("muted")
+                                ui.icon(icons.get(d.get("kind"), "folder"), size="xs").classes("muted")
                                 ui.label(d["name"]).classes("ellipsis1 grow")
                                 if d["is_project"]:
                                     ui.badge("project").props("outline")
@@ -1123,23 +1540,30 @@ class Workbench:
                     with ui.row().classes("w-full items-center gap-2 p-2").style("border-top:1px solid var(--wb-border)"):
                         nd, nf = len(lst["dirs"]), len(lst["files"])
                         readable = sum(f["supported"] for f in lst["files"])
-                        ui.button("Use this folder", on_click=lambda: pick(lst["path"])).props("unelevated no-caps dense")
-                        ui.label(f"{nd} folder{'s' if nd != 1 else ''} · {nf} file{'s' if nf != 1 else ''}"
-                                 + (f" ({readable} readable)" if nf else "") + " · double-click a folder to pick it") \
-                            .classes("muted text-xs")
+                        if at_locations:
+                            ui.label("Shared folder not listed? Type its path in the Folder box, e.g. "
+                                     "\\\\server\\share\\team or S:\\Team, then click Browse….").classes("muted text-xs")
+                        else:
+                            ui.button("Use this folder", on_click=lambda: pick(lst["path"])).props("unelevated no-caps dense")
+                            ui.label(f"{nd} folder{'s' if nd != 1 else ''} · {nf} file{'s' if nf != 1 else ''}"
+                                     + (f" ({readable} readable)" if nf else "") + " · double-click a folder to pick it") \
+                                .classes("muted text-xs")
 
-            def browse(path):
+            async def browse(path):
+                # Network shares can be slow: list them off the UI thread.
                 try:
-                    state["listing"], state["error"] = fs.list_dirs(path), ""
+                    state["listing"], state["error"] = await asyncio.to_thread(fs.list_dirs, path), ""
                 except Exception as e:
                     state["error"] = str(e)
+                    if not state["listing"]:
+                        state["listing"] = await asyncio.to_thread(fs.list_dirs, None)
                 picker.refresh()
 
-            def toggle_picker():
+            async def toggle_picker():
                 state["picking"] = not state["picking"]
-                if state["picking"]:
-                    browse(folder.value.strip() or None)
                 picker.refresh()
+                if state["picking"]:
+                    await browse(folder.value.strip() or None)
 
             def pick(path):
                 folder.value = path
@@ -1290,9 +1714,9 @@ class Workbench:
                 try:
                     names = await llm.list_models({**settings.provider(name), **p, "api_key": keys[name] or settings.provider(name).get("api_key", "")})
                     model.set_autocomplete(names)
-                    ui.notify(f"{len(names)} models: " + ", ".join(names[:8]) + ("…" if len(names) > 8 else ""))
+                    self.notify(f"{len(names)} models: " + ", ".join(names[:8]) + ("…" if len(names) > 8 else ""))
                 except llm.LLMError as e:
-                    ui.notify(str(e), type="negative", multi_line=True)
+                    self.notify(str(e), type="negative", multi_line=True)
             ui.button("List", on_click=list_models).props("outline no-caps")
         ui.input("API key" + (" (stored — leave blank to keep)" if p.get("has_api_key") or settings.provider(name).get("api_key") else ""),
                  password=True, password_toggle_button=True,

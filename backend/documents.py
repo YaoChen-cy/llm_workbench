@@ -14,13 +14,14 @@ In a chat, documents get labels D1, D2..., so the LLM cites e.g. [D1-p3-2].
 import functools
 import hashlib
 import json
+import shutil
 import re
 from collections import Counter
 from pathlib import Path
 
 import pymupdf
 
-from .settings import DOCS_DIR
+from .settings import DOCS_DIR, ROOT, UPLOADS_DIR
 
 PARSER_VERSION = 2
 HEADER_FOOTER_BAND = 0.08      # top/bottom fraction of the page checked for running headers/footers
@@ -58,6 +59,7 @@ def ingest(path: Path, name: str | None = None) -> dict:
     if f.exists():
         doc = json.loads(f.read_text("utf-8"))
         if doc.get("parser_version") == PARSER_VERSION:
+            _keep_copy(doc_id, path)
             return doc
     suffix = path.suffix.lower()
     if suffix == ".pdf":
@@ -70,11 +72,58 @@ def ingest(path: Path, name: str | None = None) -> dict:
     else:
         raise ValueError(f"unsupported file type: {suffix}")
     doc = {"id": doc_id, "parser_version": PARSER_VERSION, "name": name or path.name, "kind": kind,
-           "source_path": str(path), "pages": pages, "warnings": warnings, "blocks": blocks}
+           "source_path": str(path.resolve()), "pages": pages, "warnings": warnings, "blocks": blocks}
     f.parent.mkdir(parents=True, exist_ok=True)
+    _keep_copy(doc_id, path)
     f.write_text(json.dumps(doc, ensure_ascii=False, indent=1), "utf-8")
     (f.parent / "doc.md").write_text(to_markdown(doc, "D"), "utf-8")
     return doc
+
+
+# ---------------------------------------------------------------- the original file
+
+def _keep_copy(doc_id: str, path: Path):
+    """Keep a copy of the original next to the parse, so citations still open when the file is moved,
+    renamed, or on a drive that is offline. The doc id is the content hash, so the copy is exact."""
+    d = DOCS_DIR / doc_id
+    if not any(d.glob("source.*")):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, d / f"source{path.suffix.lower()}")
+        except OSError:
+            pass
+
+
+def _find_moved(doc: dict) -> Path | None:
+    """Look for a moved original (e.g. the app folder was renamed): the same path tail under the app folder,
+    or an upload with the same name. Accepted only if its content hash matches."""
+    old = Path(doc["source_path"])
+    candidates = [ROOT / Path(*old.parts[i:]) for i in range(1, len(old.parts))]
+    candidates += sorted(UPLOADS_DIR.glob(f"*{old.name}"))
+    for c in candidates:
+        try:
+            if c.is_file() and file_hash(c) == doc["id"]:
+                return c
+        except OSError:
+            continue
+    return None
+
+
+def source_file(doc: dict) -> Path:
+    """The original file of a parsed document (kept copy, original path, or a moved original)."""
+    kept = next((DOCS_DIR / doc["id"]).glob("source.*"), None)
+    if kept:
+        return kept
+    p = Path(doc["source_path"])
+    if not p.is_absolute():
+        p = ROOT / p
+    if not p.exists():
+        p = _find_moved(doc)
+    if p is None:
+        raise FileNotFoundError(f"The original file of {doc['name']} is no longer at {doc['source_path']}. "
+                                "Attach it again to see its pages.")
+    _keep_copy(doc["id"], p)
+    return next((DOCS_DIR / doc["id"]).glob("source.*"), p)
 
 
 # ---------------------------------------------------------------- rendering for the LLM
@@ -436,10 +485,10 @@ def locate(doc_id: str, block_id: str, claim: str = "") -> dict:
     out["sentences"] = [block["text"][s:e] for s, e in spans]
     out["sentence_spans"] = [list(sp) for sp in spans]
     if doc["kind"] == "pdf":
-        pdf = pymupdf.open(doc["source_path"])
+        pdf = pymupdf.open(source_file(doc))
         out["page_sizes"] = {pi: [pdf[pi].rect.width, pdf[pi].rect.height] for pi in {r[0] for r in block["rects"]}}
         for sentence in out["sentences"]:
-            out["sentence_rects"] += _sentence_rects(doc["source_path"], block, sentence)
+            out["sentence_rects"] += _sentence_rects(str(source_file(doc)), block, sentence)
     return out
 
 
@@ -455,7 +504,7 @@ def render_page(doc_id: str, page: int, zoom: float = 1.5, block_id: str = "", c
     doc = get(doc_id)
     if doc["kind"] != "pdf":
         raise ValueError("only PDF documents have page images")
-    pdf = pymupdf.open(doc["source_path"])
+    pdf = pymupdf.open(source_file(doc))
     if not 1 <= page <= pdf.page_count:
         raise FileNotFoundError(f"page {page} out of range")
     pg = pdf[page - 1]

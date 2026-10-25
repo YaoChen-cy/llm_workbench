@@ -237,8 +237,10 @@ def render_answer(text: str, resolve) -> str:
                 loc = f"p.{block['page']}" if doc["kind"] == "pdf" else f"¶{block['id'][1:]}"
                 where = f"page {block['page']}" if doc["kind"] == "pdf" else f"block {block['id']}"
                 tip = f"{entry['name']} — {where}\n{block['heading']}\n{block['text'][:400]}\n(click to open)"
+                # Escape, and encode line breaks so a chip inside a Markdown table row doesn't break the row.
+                tip = html.escape(tip, quote=True).replace("\n", "&#10;")
                 out.append(f'<span class="cite" data-ok="1" data-cite="{html.escape(cid)}" '
-                           f'data-claim="{html.escape(claim, quote=True)}" title="{html.escape(tip, quote=True)}">'
+                           f'data-claim="{html.escape(claim, quote=True)}" title="{tip}">'
                            f"{label} · {loc}</span>")
             else:
                 out.append(f'<span class="cite bad" title="Source {html.escape(cid)} not found in the attached documents">'
@@ -852,7 +854,12 @@ class Workbench:
         entry, doc, block = self.resolve(cid)
         if not block:
             return
-        loc = documents.locate(entry["doc_id"], block["id"], claim)
+        try:
+            loc = documents.locate(entry["doc_id"], block["id"], claim)
+        except Exception as e:                 # never fail silently: say why the source can't be shown
+            self.notify(f"Can't open the source of {cid}: {e}", type="negative", multi_line=True,
+                        timeout=0, close_button=True)
+            return
         self.source = {"doc_id": entry["doc_id"], "label": cid, "block_id": block["id"], "claim": claim,
                        "loc": loc, "page": block["page"], "zoom": 1.0}
         self.right = None

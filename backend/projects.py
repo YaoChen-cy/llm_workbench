@@ -10,6 +10,7 @@ data/projects.json maps project ids to folders. Opening a folder that already ha
 Inside a project, documents can only be read from <folder> and outputs are only written to <folder>.
 """
 import json
+import os
 import re
 import time
 import uuid
@@ -47,12 +48,13 @@ def save(p: dict):
 
 
 def create(name: str, folder: str, instructions: str = "", create_folder: bool = False) -> dict:
-    f = Path(folder).expanduser()
+    f = Path(folder.strip().strip('"')).expanduser()
     if not f.is_absolute():
-        raise ValueError("Folder must be an absolute path, e.g. /Users/you/Documents/memos or C:\\Work\\memos")
-    f = f.resolve()
+        raise ValueError("Folder must be an absolute path, e.g. /Users/you/Documents/memos, C:\\Work\\memos "
+                         "or \\\\server\\share\\team")
+    f = Path(os.path.abspath(f))
     if f == Path(f.anchor) or f == Path.home():
-        raise ValueError("Pick a dedicated folder, not the drive root or your home folder.")
+        raise ValueError("Pick a dedicated folder inside the drive or share, not its root or your home folder.")
     if not f.exists():
         if not create_folder:
             raise ValueError(f"Folder does not exist: {f}")

@@ -11,7 +11,7 @@ import time
 import uuid
 from collections import Counter
 
-from . import documents, outputs
+from . import documents, knowledge, outputs
 from .settings import CHATS_DIR
 
 SYSTEM_PROMPT = """You are a careful assistant working with the user's documents.
@@ -152,6 +152,8 @@ def build_messages(chat: dict, user_text: str, context_tokens: int,
         if project["instructions"].strip():
             system += ("\nFollow the project instructions below for every request in this project."
                        f"\n<project_instructions>\n{project['instructions'].strip()}\n</project_instructions>")
+    if project:
+        system += knowledge.prompt_section(project)
     system += "\n" + outputs.FILE_INSTRUCTIONS.format(where=outputs.WHERE_PROJECT if project else outputs.WHERE_CHAT)
     if docs:
         system += "\n\n<documents>\n" + "\n\n".join(full) + "\n</documents>"

@@ -23,6 +23,7 @@ full file content
 - Supported types: .md, .txt, .csv, .json and .docx. For .docx, write the content in Markdown (headings, bullet lists, **bold**, tables); it is converted to a Word document.
 - Use a short descriptive file name; subfolders are allowed (e.g. path="drafts/summary.docx").
 - Put the complete content in the block. Outside the block, say in one sentence what the file contains.
+- When the user asks you to draft or write a summary (or a report they will keep), deliver it as a .docx file block unless they ask for another format, with the citations inside the file content. The app shows the file's text in the chat with clickable citations, followed by a download/preview box, so do not repeat the content outside the block.
 - Never say that you cannot create files."""
 
 WHERE_PROJECT = "The user saves it to the project folder with one click (or downloads it)."

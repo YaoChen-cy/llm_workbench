@@ -157,7 +157,7 @@ def page_image(doc_id: str, page: int, zoom: float = 1.5, block: str = "", claim
 @app.get("/api/documents/{doc_id}/file")
 def get_document_file(doc_id: str):
     try:
-        return FileResponse(documents.get(doc_id)["source_path"])
+        return FileResponse(documents.source_file(documents.get(doc_id)))
     except Exception as e:
         _err(e)
 

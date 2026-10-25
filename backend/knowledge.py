@@ -130,7 +130,7 @@ def add_example_from_chat(pid: str, chat: dict, summary_md: str, name: str) -> d
     sources = []
     for d in entries:
         try:
-            src = Path(documents.get(d["doc_id"])["source_path"])
+            src = documents.source_file(documents.get(d["doc_id"]))
             sources.append((d["name"], src.read_bytes()))
         except (FileNotFoundError, OSError):
             continue

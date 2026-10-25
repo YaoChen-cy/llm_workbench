@@ -11,6 +11,7 @@ Each block:
 
 In a chat, documents get labels D1, D2..., so the LLM cites e.g. [D1-p3-2].
 """
+import functools
 import hashlib
 import json
 import re
@@ -430,11 +431,42 @@ def locate(doc_id: str, block_id: str, claim: str = "") -> dict:
         raise FileNotFoundError(f"{block_id} not found in {doc['name']}")
     out = {"doc_id": doc_id, "name": doc["name"], "kind": doc["kind"], "pages": doc["pages"],
            "block": {k: block[k] for k in ("id", "type", "page", "heading", "text", "rects")},
-           "sentences": [], "sentence_spans": [], "sentence_rects": []}
+           "sentences": [], "sentence_spans": [], "sentence_rects": [], "page_sizes": {}}
     spans = matching_sentences(block["text"], claim) if claim and block["type"] == "paragraph" else []
     out["sentences"] = [block["text"][s:e] for s, e in spans]
     out["sentence_spans"] = [list(sp) for sp in spans]
     if doc["kind"] == "pdf":
+        pdf = pymupdf.open(doc["source_path"])
+        out["page_sizes"] = {pi: [pdf[pi].rect.width, pdf[pi].rect.height] for pi in {r[0] for r in block["rects"]}}
         for sentence in out["sentences"]:
             out["sentence_rects"] += _sentence_rects(doc["source_path"], block, sentence)
     return out
+
+
+# ---------------------------------------------------------------- page images (source viewer)
+
+HL_BLOCK = (1.0, 0.86, 0.2)        # light yellow: the cited paragraph
+HL_SENTENCE = (1.0, 0.72, 0.0)     # stronger yellow: the sentence(s) that support the claim
+
+
+@functools.lru_cache(maxsize=64)
+def render_page(doc_id: str, page: int, zoom: float = 1.5, block_id: str = "", claim: str = "") -> bytes:
+    """PNG of `page` (1-based) with the cited block and matching sentences highlighted."""
+    doc = get(doc_id)
+    if doc["kind"] != "pdf":
+        raise ValueError("only PDF documents have page images")
+    pdf = pymupdf.open(doc["source_path"])
+    if not 1 <= page <= pdf.page_count:
+        raise FileNotFoundError(f"page {page} out of range")
+    pg = pdf[page - 1]
+    if block_id:
+        loc = locate(doc_id, block_id, claim)
+        for pi, *r in loc["block"]["rects"]:
+            if pi == page - 1:
+                pg.draw_rect(pymupdf.Rect(r) + (-2, -2, 2, 2), color=None, fill=HL_BLOCK, fill_opacity=0.22, overlay=True)
+                pg.draw_line(pymupdf.Point(r[0] - 4, r[1] - 2), pymupdf.Point(r[0] - 4, r[3] + 2),
+                             color=HL_SENTENCE, width=2.5, overlay=True)
+        for pi, *r in loc["sentence_rects"]:
+            if pi == page - 1:
+                pg.draw_rect(pymupdf.Rect(r) + (-1, -1, 1, 1), color=None, fill=HL_SENTENCE, fill_opacity=0.38, overlay=True)
+    return pg.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), alpha=False).tobytes("png")

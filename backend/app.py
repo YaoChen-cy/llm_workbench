@@ -1,9 +1,9 @@
 """
 FastAPI server.  Run from the repo root:
 
-    .venv/bin/uvicorn backend.app:app --port 8000
+    python start.py                 (or: .venv/bin/uvicorn backend.app:app --port 8000)
 
-Serves the API under /api and, if built, the React app from frontend/dist.
+Serves the REST API under /api and the NiceGUI user interface (backend/ui.py) at /.
 """
 import json
 import re
@@ -12,8 +12,7 @@ import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from . import chats, documents, llm, projects, settings
@@ -142,6 +141,15 @@ def get_document(doc_id: str):
 def locate_citation(doc_id: str, block: str, claim: str = ""):
     try:
         return documents.locate(doc_id, block, claim[:1000])
+    except Exception as e:
+        _err(e)
+
+
+@app.get("/api/documents/{doc_id}/page/{page}.png")
+def page_image(doc_id: str, page: int, zoom: float = 1.5, block: str = "", claim: str = ""):
+    try:
+        png = documents.render_page(doc_id, page, max(0.5, min(zoom, 4.0)), block, claim[:1000])
+        return Response(png, media_type="image/png", headers={"Cache-Control": "private, max-age=3600"})
     except Exception as e:
         _err(e)
 
@@ -367,8 +375,8 @@ async def send_message(chat_id: str, req: MessageReq):
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
 
-# ---------------------------------------------------------------- frontend
+# ---------------------------------------------------------------- user interface (NiceGUI, pure Python)
 
-DIST = settings.ROOT / "frontend" / "dist"
-if DIST.exists():
-    app.mount("/", StaticFiles(directory=DIST, html=True), name="frontend")
+from . import ui  # noqa: E402  (registers the pages and mounts NiceGUI on this app)
+
+ui.attach(app)

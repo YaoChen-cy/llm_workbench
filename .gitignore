@@ -3,7 +3,11 @@ __pycache__/
 *.pyc
 .DS_Store
 .env
+env.txt
 data/
-frontend/node_modules/
-frontend/dist/
 .claude/
+*.zip
+# unzipped copies of the package
+llm-workbench/
+# test files for the company PC / email filter
+company_test/

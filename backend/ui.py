@@ -1,0 +1,1256 @@
+"""
+User interface written in Python with NiceGUI: no JavaScript build step and no .js/.css/.html files to ship.
+NiceGUI's own browser assets come from the `nicegui` pip package.
+
+One `Workbench` object per browser tab holds the UI state and calls the backend modules directly.
+"""
+import asyncio
+import html
+import json
+import re
+import time
+from pathlib import Path
+from urllib.parse import quote
+
+from nicegui import events, ui
+
+from . import chats, documents, llm, projects, settings
+from . import files as fs
+
+# ---------------------------------------------------------------- styling
+
+CSS = """
+:root { --wb-bg:#f7f7f5; --wb-panel:#fff; --wb-side:#efeeea; --wb-text:#1d1d1b; --wb-muted:#6b6a66; --wb-border:#e0ded8;
+  --wb-accent:#2f5bea; --wb-accent-soft:#e6ecfd; --wb-user:#e9eefc; --wb-error:#b42318; --wb-code:#f1f0ec;
+  --wb-hl:rgba(255,196,0,.5); --wb-hl-soft:rgba(255,214,10,.18); }
+body.body--dark { --wb-bg:#18181a; --wb-panel:#1f1f22; --wb-side:#141416; --wb-text:#ececea; --wb-muted:#9c9b97;
+  --wb-border:#333338; --wb-accent:#6d8dff; --wb-accent-soft:#24304f; --wb-user:#26304a; --wb-error:#ff8a80; --wb-code:#2a2a2e;
+  --wb-hl:rgba(255,196,0,.35); --wb-hl-soft:rgba(255,214,10,.1); }
+body { background: var(--wb-bg); color: var(--wb-text); font-size: 14px; }
+.q-drawer { background: var(--wb-side) !important; }
+.rightpanel .q-drawer { background: var(--wb-panel) !important; }
+.wb-header { background: var(--wb-panel) !important; color: var(--wb-text) !important; border-bottom: 1px solid var(--wb-border); }
+.wb-footer { background: var(--wb-bg) !important; color: var(--wb-text) !important; }
+.muted { color: var(--wb-muted); }
+.side-head { font-size: 11px; font-weight: 650; letter-spacing: .04em; text-transform: uppercase; color: var(--wb-muted); }
+.side-item { border-radius: 7px; padding: 6px 8px; cursor: pointer; width: 100%; }
+.side-item:hover { background: var(--wb-border); }
+.side-item.on { background: var(--wb-panel); box-shadow: 0 0 0 1px var(--wb-border); }
+.side-item.in { background: var(--wb-accent-soft); }
+.ellipsis1 { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.wrap-anywhere { overflow-wrap: anywhere; }
+.bubble { background: var(--wb-user); padding: 9px 14px; border-radius: 14px 14px 4px 14px; max-width: 80%; white-space: pre-wrap; overflow-wrap: anywhere; }
+.card { background: var(--wb-panel); border: 1px solid var(--wb-border); border-radius: 12px; padding: 14px 16px; width: 100%; }
+.notice { background: var(--wb-accent-soft); border-radius: 8px; padding: 6px 10px; white-space: pre-wrap; font-size: 12.5px; width: 100%; }
+.err { color: var(--wb-error); white-space: pre-wrap; }
+.chip { display: inline-flex; align-items: center; gap: 4px; font-size: 12.5px; background: var(--wb-panel); border: 1px solid var(--wb-border); border-radius: 14px; padding: 1px 4px 1px 10px; }
+.chip b { color: var(--wb-accent); }
+.answer .nicegui-markdown p { margin: 0 0 10px; }
+.answer .nicegui-markdown table { border-collapse: collapse; }
+.answer .nicegui-markdown th, .answer .nicegui-markdown td { border: 1px solid var(--wb-border); padding: 3px 8px; }
+.cite { display: inline-block; font-size: 11px; font-weight: 600; line-height: 1.5; padding: 0 5px; margin: 0 1px; border-radius: 4px;
+  background: var(--wb-accent-soft); color: var(--wb-accent); vertical-align: 1px; white-space: nowrap; cursor: pointer; }
+.cite:hover { background: var(--wb-accent); color: #fff; }
+.cite.bad { background: transparent; color: var(--wb-error); outline: 1px dashed var(--wb-error); cursor: help; }
+.type-badge { display: inline-block; min-width: 46px; text-align: center; font-size: 10.5px; font-weight: 650; padding: 1px 5px; border-radius: 4px; background: var(--wb-code); color: var(--wb-muted); flex: 0 0 auto; }
+.t-pdf { background: #fde8e7; color: #b42318; } .t-docx, .t-doc { background: #e6ecfd; color: #2f5bea; }
+.t-md, .t-txt { background: #e7f6ec; color: #18794e; } .t-xlsx, .t-xls, .t-csv { background: #e3f5ef; color: #0f7a55; }
+body.body--dark .t-pdf { background: #4a2020; color: #ff9b94; } body.body--dark .t-docx { background: #24304f; color: #9db3ff; }
+body.body--dark .t-md, body.body--dark .t-txt { background: #1d3a2a; color: #7fd8a4; }
+.fs-row { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 6px; width: 100%; }
+.fs-row.click { cursor: pointer; } .fs-row.click:hover { background: var(--wb-bg); }
+.fs-off { opacity: .45; }
+.q-drawer .q-scrollarea__content { width: 100%; max-width: 100%; }
+.fs-row > * { min-width: 0; }
+.quote mark, .text-view mark { background: var(--wb-hl); color: inherit; border-radius: 2px; }
+.text-view { background: var(--wb-panel); border-radius: 8px; padding: 12px 14px; font-size: 13px; line-height: 1.55; }
+.tb { padding: 2px 6px 2px 8px; border-left: 3px solid transparent; white-space: pre-wrap; margin-bottom: 6px; }
+.tb.cited { background: var(--wb-hl-soft); border-left-color: #f0b400; }
+.tb-id { float: right; font-size: 10px; color: var(--wb-muted); margin-left: 8px; }
+.tb-h { font-weight: 650; margin: 8px 0 4px; }
+.tb-table { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 11.5px; white-space: pre; overflow-x: auto; }
+.pdf-scroll { background: var(--wb-side); }
+code { background: var(--wb-code); padding: 1px 5px; border-radius: 4px; font-size: 12.5px; }
+"""
+
+# Clicking a citation chip inside rendered markdown sends a "cite" event to Python.
+CITE_SCRIPT = """<script>
+document.addEventListener('click', (e) => {
+  const c = e.target.closest('[data-cite]');
+  if (c && c.dataset.ok) emitEvent('cite', {id: c.dataset.cite, claim: c.dataset.claim || ''});
+});
+</script>"""
+
+INSTRUCTIONS_HINT = """Describe the task the assistant should perform in this project, e.g.
+
+Draft a credit summary for each memo I attach.
+- Two sections: "Situation Recap" and "Recent Development", 2-4 bullet points each.
+- Bold the key figures. Use $mm for amounts.
+- Only use facts from the attached memo; ask me if something important is missing."""
+
+# ---------------------------------------------------------------- file info helpers
+
+TYPES = {"pdf": "PDF", "docx": "Word", "doc": "Word 97", "txt": "Text", "md": "Markdown", "xlsx": "Excel",
+         "xls": "Excel", "csv": "CSV", "pptx": "PowerPoint", "png": "Image", "jpg": "Image", "jpeg": "Image",
+         "json": "JSON", "msg": "Outlook", "zip": "Archive"}
+ACCEPT = ".pdf,.docx,.txt,.md"
+
+
+def ext(name: str) -> str:
+    return Path(name).suffix.lower().lstrip(".")
+
+
+def file_type(name: str) -> str:
+    return TYPES.get(ext(name), ext(name).upper() or "File")
+
+
+def supported(name: str) -> bool:
+    return f".{ext(name)}" in fs.SUPPORTED
+
+
+def file_size(n) -> str:
+    if n is None:
+        return ""
+    return f"{n} B" if n < 1024 else f"{n / 1024:.0f} KB" if n < 1 << 20 else f"{n / (1 << 20):.1f} MB"
+
+
+def type_badge(name: str):
+    return ui.label(file_type(name)).classes(f"type-badge t-{ext(name) or 'file'}")
+
+
+def describe(m: dict) -> str:
+    pages = f", {m['pages']} page{'s' if m['pages'] != 1 else ''}" if m.get("kind") == "pdf" and m.get("pages") else ""
+    return f"{m['name']} ({file_type(m['name'])}{pages})"
+
+
+def report(metas: list[dict], verb: str = "Added") -> str:
+    """One message for an upload/attach result: successes with name and type, duplicates, failures, warnings."""
+    ok = [m for m in metas if m.get("ok") and not m.get("duplicate")]
+    dup = [m for m in metas if m.get("ok") and m.get("duplicate")]
+    lines = []
+    if ok:
+        lines.append(f"✓ {verb} {len(ok)} file{'s' if len(ok) != 1 else ''}: " + ", ".join(describe(m) for m in ok))
+    if dup:
+        lines.append("Already in context: " + ", ".join(m["name"] for m in dup))
+    lines += [f"✗ Could not add {m['name']}: {m.get('error')}" for m in metas if not m.get("ok")]
+    lines += [f"⚠ {m['name']}: {w}" for m in metas for w in (m.get("warnings") or [])]
+    return "\n".join(lines)
+
+
+def rejected(_e=None):
+    ui.notify("Some files were skipped: only PDF, Word (.docx), Text and Markdown files can be read.", type="warning")
+
+
+def slug(s: str) -> str:
+    return re.sub(r"\s+", "_", re.sub(r"[^\w\- ]+", "", s).strip())[:50] or "output"
+
+
+# ---------------------------------------------------------------- citations in answers
+
+_ID = r"[CD]\d+-[a-z]?\d+(?:-t?\d+)?"
+CITE_GROUP = re.compile(rf"\[({_ID}(?:\s*[,;]\s*{_ID})*)\]", re.I)
+
+
+def claim_before(prefix: str) -> str:
+    """The sentence a citation backs: text since the previous sentence end / citation / line break."""
+    line = CITE_GROUP.sub("\0", prefix[prefix.rfind("\n") + 1:])
+    parts = [s.strip() for s in re.split(r"\0|(?<=[.!?])\s+(?=[A-Z*\"(])", line)]
+    claim = ""
+    for s in reversed(parts):
+        if len(claim) >= 40:
+            break
+        claim = f"{s} {claim}"
+    claim = re.sub(r"[*_`#>|]", "", claim)
+    return re.sub(r"^\s*([-+]|\d+\.)\s+", "", claim).strip()[:600]
+
+
+def render_answer(text: str, resolve) -> str:
+    """Markdown with [D1-p2-3] citations replaced by clickable chips (HTML spans)."""
+    def chip(m):
+        claim = claim_before(text[:m.start()])
+        out = []
+        for cid in re.split(r"\s*[,;]\s*", m.group(1)):
+            entry, doc, block = resolve(cid)
+            label = cid.split("-")[0].upper()
+            if block:
+                loc = f"p.{block['page']}" if doc["kind"] == "pdf" else f"¶{block['id'][1:]}"
+                where = f"page {block['page']}" if doc["kind"] == "pdf" else f"block {block['id']}"
+                tip = f"{entry['name']} — {where}\n{block['heading']}\n{block['text'][:400]}\n(click to open)"
+                out.append(f'<span class="cite" data-ok="1" data-cite="{html.escape(cid)}" '
+                           f'data-claim="{html.escape(claim, quote=True)}" title="{html.escape(tip, quote=True)}">'
+                           f"{label} · {loc}</span>")
+            else:
+                out.append(f'<span class="cite bad" title="Source {html.escape(cid)} not found in the attached documents">'
+                           f"{label} · ?</span>")
+        return "".join(out)
+    return CITE_GROUP.sub(chip, text)
+
+
+def marked(text: str, spans: list) -> str:
+    """HTML-escaped text with the given character spans wrapped in <mark>."""
+    out, at = [], 0
+    for s, e in sorted(spans):
+        out += [html.escape(text[at:s]), f"<mark>{html.escape(text[s:e])}</mark>"]
+        at = e
+    out.append(html.escape(text[at:]))
+    return "".join(out)
+
+
+# ---------------------------------------------------------------- small dialogs
+
+async def confirm(message: str, ok: str = "OK") -> bool:
+    with ui.dialog() as dialog, ui.card().classes("w-[440px] max-w-full"):
+        ui.label(message).classes("whitespace-pre-wrap")
+        with ui.row().classes("w-full justify-end"):
+            ui.button("Cancel", on_click=lambda: dialog.submit(False)).props("flat no-caps")
+            ui.button(ok, on_click=lambda: dialog.submit(True)).props("unelevated no-caps")
+    result = await dialog
+    dialog.delete()
+    return bool(result)
+
+
+async def ask_text(title: str, value: str, ok: str = "OK") -> str | None:
+    with ui.dialog() as dialog, ui.card().classes("w-[480px] max-w-full"):
+        ui.label(title).classes("whitespace-pre-wrap")
+        inp = ui.input(value=value).classes("w-full").props("outlined dense autofocus")
+        inp.on("keydown.enter", lambda: dialog.submit(inp.value))
+        with ui.row().classes("w-full justify-end"):
+            ui.button("Cancel", on_click=lambda: dialog.submit(None)).props("flat no-caps")
+            ui.button(ok, on_click=lambda: dialog.submit(inp.value)).props("unelevated no-caps")
+    result = await dialog
+    dialog.delete()
+    return result
+
+
+# ---------------------------------------------------------------- the page
+
+class Workbench:
+    def __init__(self):
+        self.project: dict | None = None
+        self.chat: dict | None = None
+        self.right: str | None = None          # None | "files" | "context" | "source"
+        self.source: dict | None = None        # {doc_id, label, block_id, claim, loc, page, zoom}
+        self.fs_path: str | None = None        # current folder in the files panel (None = list of roots)
+        self.fs_selected: set[str] = set()
+        self.notice = ""
+        self.project_notice = ""
+        self.pending = False
+        self.task: asyncio.Task | None = None
+        self.busy = False
+        self.docs: dict[str, dict] = {}
+
+    # ---------- data helpers
+
+    def doc(self, doc_id: str) -> dict | None:
+        if doc_id not in self.docs:
+            try:
+                self.docs[doc_id] = documents.get(doc_id)
+            except FileNotFoundError:
+                return None
+        return self.docs[doc_id]
+
+    def entries(self) -> list[dict]:
+        return (self.chat["docs"] if self.chat else []) + (self.project["context"] if self.project else [])
+
+    def resolve(self, cid: str):
+        label, _, bid = cid.partition("-")
+        entry = next((d for d in self.entries() if d["label"].lower() == label.lower()), None)
+        doc = self.doc(entry["doc_id"]) if entry else None
+        block = next((b for b in doc["blocks"] if b.get("id") == bid), None) if doc else None
+        return entry, doc, block
+
+    def reload_project(self):
+        if self.project:
+            self.project = projects.get(self.project["id"])
+
+    # ---------- layout
+
+    def build(self):
+        # Elements created in event handlers attach to the handler's slot, which a refresh may delete.
+        # Dialogs therefore live under this stable root, and page JS runs through the client.
+        self.client = ui.context.client
+        self.root = ui.element("div")
+        ui.add_css(CSS)
+        ui.add_body_html(CITE_SCRIPT)
+        ui.page_title("LLM Workbench")
+        ui.dark_mode(None)                      # follow the system setting
+        ui.on("cite", lambda e: self.open_source(e.args.get("id", ""), e.args.get("claim", "")))
+
+        with ui.left_drawer(value=True, fixed=True).props("width=260 bordered breakpoint=700").classes("p-3"):
+            self.sidebar()
+        with ui.header().classes("wb-header items-center gap-3 px-4 py-2"):
+            self.topbar()
+        self.drawer = ui.right_drawer(value=False, fixed=True).props("bordered breakpoint=700").classes("rightpanel p-0")
+        with self.drawer:
+            self.right_panel()
+        self.footer = ui.footer().classes("wb-footer px-4 pb-3 pt-1")
+        with self.footer:
+            self.composer()
+        self.main()
+
+    # ---------- sidebar
+
+    @ui.refreshable
+    def sidebar(self):
+        with ui.column().classes("w-full h-full gap-1 no-wrap"):
+            with ui.row().classes("items-center gap-2 px-1 pb-2"):
+                ui.icon("article", color="primary").classes("text-xl")
+                ui.label("LLM Workbench").classes("font-semibold")
+            ui.button("+ New chat in project" if self.project else "+ New chat", on_click=self.new_chat) \
+                .props("unelevated no-caps").classes("w-full")
+            with ui.scroll_area().classes("w-full grow"):
+                with ui.row().classes("w-full items-center justify-between px-1 pt-3"):
+                    ui.label("Projects").classes("side-head")
+                    ui.button(icon="add", on_click=self.new_project_dialog).props("flat dense round size=sm") \
+                        .tooltip("New project")
+                plist = projects.list_all()
+                if not plist:
+                    ui.button("Create your first project", on_click=self.new_project_dialog) \
+                        .props("flat dense no-caps size=sm color=primary")
+                for p in plist:
+                    cls = ("in" if self.chat else "on") if self.project and self.project["id"] == p["id"] else ""
+                    with ui.row().classes(f"side-item {cls} items-center gap-2 no-wrap {'fs-off' if p['missing'] else ''}") \
+                            .on("click", lambda pid=p["id"]: self.open_project(pid)):
+                        ui.icon("folder_special", size="xs").classes("muted")
+                        ui.label(p["name"]).classes("ellipsis1")
+                        ui.tooltip(f"Folder missing: {p['folder']}" if p["missing"] else p["folder"])
+
+                with ui.row().classes("w-full items-center justify-between px-1 pt-3 no-wrap"):
+                    ui.label(f"Chats · {self.project['name']}" if self.project else "Chats").classes("side-head ellipsis1")
+                    if self.project:
+                        ui.button("All chats", on_click=lambda: self.open_project(None)) \
+                            .props("flat dense no-caps size=sm color=primary")
+                clist = chats.list_all(self.project["id"] if self.project else None)
+                if not clist:
+                    ui.label("No chats yet.").classes("muted text-xs px-2")
+                for c in clist:
+                    cls = "on" if self.chat and self.chat["id"] == c["id"] else ""
+                    with ui.row().classes(f"side-item {cls} items-center gap-1 no-wrap") \
+                            .on("click", lambda cid=c["id"]: self.open_chat(cid)):
+                        ui.label(c["title"]).classes("ellipsis1 grow")
+                        if c["n_docs"]:
+                            ui.badge(str(c["n_docs"])).props("outline")
+                        ui.button(icon="close").props("flat dense round size=xs") \
+                            .on("click.stop", lambda cid=c["id"]: self.delete_chat(cid))
+            ui.button("Settings", icon="settings", on_click=self.settings_dialog).props("outline no-caps").classes("w-full")
+            p = settings.provider()
+            ui.label(f"{p['label']}: {p['model']}").classes("muted text-xs ellipsis1 px-1")
+
+    # ---------- header
+
+    @ui.refreshable
+    def topbar(self):
+        with ui.row().classes("grow items-center gap-1 no-wrap min-w-0"):
+            if self.project:
+                ui.button(self.project["name"], on_click=lambda: self.open_project(self.project["id"])) \
+                    .props("flat dense no-caps color=primary").classes("font-semibold")
+                if self.chat:
+                    ui.label("›").classes("muted")
+            title = self.chat["title"] if self.chat else ("" if self.project else "New chat")
+            ui.label(title).classes("font-semibold ellipsis1")
+        s = settings.load()
+        ui.select({k: f"{p['label']} · {p['model']}" for k, p in s["providers"].items()}, value=s["active_provider"],
+                  on_change=self.change_provider).props("dense outlined options-dense").classes("w-64")
+        if self.chat or not self.project:
+            ui.button("Files", icon="folder_open", on_click=lambda: self.toggle_right("files")) \
+                .props(f"{'unelevated' if self.right == 'files' else 'outline'} no-caps")
+
+    def change_provider(self, e):
+        settings.update({"active_provider": e.value})
+        self.sidebar.refresh()
+
+    # ---------- main area
+
+    @ui.refreshable
+    def main(self):
+        self.footer.set_visibility(not (self.project and not self.chat))
+        if self.project and not self.chat:
+            self.project_view()
+            return
+        self.msg_col = ui.column().classes("w-full max-w-[820px] mx-auto gap-4 pb-4")
+        with self.msg_col:
+            if not self.chat or not self.chat["messages"]:
+                with ui.column().classes("w-full items-center text-center mt-[12vh] gap-2"):
+                    if self.project:
+                        ui.label(f"New chat in {self.project['name']}").classes("text-xl font-semibold")
+                        ui.label(f"The project instructions and {len(self.project['context'])} context document(s) are "
+                                 "included automatically. Attach files from the project folder with Files; use "
+                                 "Save to folder under an answer to keep it as a file.").classes("muted max-w-[540px]")
+                    else:
+                        ui.label("Ask anything, or attach documents to work with them").classes("text-xl font-semibold")
+                        ui.label("Open Files to pick documents from your allowed folders, or use the 📎 button. "
+                                 "Answers cite their sources — click a citation to see it highlighted in the original. "
+                                 "For repeated tasks, create a project.").classes("muted max-w-[540px]")
+            for m in (self.chat["messages"] if self.chat else []):
+                self.render_message(m)
+
+    def render_message(self, m: dict):
+        if m["role"] == "user":
+            with ui.row().classes("w-full justify-end"):
+                ui.label(m["content"]).classes("bubble")
+            return
+        with ui.column().classes("answer w-full gap-1"):
+            if m["content"]:
+                ui.markdown(render_answer(m["content"], self.resolve))
+            elif not m.get("error"):
+                ui.label("(empty answer)").classes("muted italic")
+            if m.get("error"):
+                ui.label(f"⚠ {m['error']}").classes("err text-xs")
+            with ui.row().classes("items-center gap-2 text-xs muted"):
+                ui.label(m.get("model", ""))
+                if (m.get("context") or {}).get("truncated"):
+                    ui.label("· documents trimmed to fit context")
+                if self.project and m["content"]:
+                    ui.button("Save to folder", on_click=lambda m=m: self.save_to_folder(m)) \
+                        .props("flat dense no-caps size=sm color=primary")
+
+    # ---------- composer
+
+    @ui.refreshable
+    def composer(self):
+        with ui.column().classes("w-full max-w-[820px] mx-auto gap-2"):
+            if self.notice:
+                with ui.row().classes("notice items-start justify-between no-wrap"):
+                    ui.label(self.notice).classes("whitespace-pre-wrap")
+                    ui.button(icon="close", on_click=lambda: self.set_notice("")).props("flat dense round size=xs")
+            chips = (self.chat["docs"] if self.chat else [])
+            if chips or (self.project and self.project["context"]):
+                with ui.row().classes("gap-2"):
+                    if self.project and self.project["context"]:
+                        n = len(self.project["context"])
+                        with ui.element("span").classes("chip").style("background:var(--wb-accent-soft);padding-right:10px"):
+                            ui.html(f"<b>C1–C{n}</b>&nbsp;project context")
+                            ui.tooltip("\n".join(f"{c['label']} {c['name']}" for c in self.project["context"])) \
+                                .classes("whitespace-pre-wrap")
+                    for d in chips:
+                        doc = self.doc(d["doc_id"])
+                        with ui.element("span").classes("chip"):
+                            ui.html(f"<b>{d['label']}</b>&nbsp;{html.escape(d['name'])}")
+                            if doc:
+                                ui.label(f"· {doc['pages']}p" if doc["kind"] == "pdf" else f"· {doc['kind']}").classes("muted")
+                            ui.button(icon="close", on_click=lambda did=d["doc_id"]: self.detach(did)) \
+                                .props("flat dense round size=xs").set_enabled(not self.pending)
+            with ui.row().classes("w-full items-end gap-2 no-wrap p-2 rounded-xl") \
+                    .style("background:var(--wb-panel);border:1px solid var(--wb-border)"):
+                up = ui.upload(multiple=True, auto_upload=True, on_multi_upload=self.on_chat_upload, on_rejected=rejected) \
+                    .props(f'accept="{ACCEPT}"').classes("hidden")
+                ui.button(icon="attach_file", on_click=lambda: up.run_method("pickFiles")) \
+                    .props("flat round dense").tooltip("Upload files").set_enabled(not self.busy)
+                self.input = ui.textarea(placeholder="Parsing documents…" if self.busy else
+                                         "Message (Enter to send, Shift+Enter for a new line)") \
+                    .props("autogrow borderless dense input-style='max-height:200px'").classes("grow")
+                self.input.on("keydown.enter.exact.prevent", self.send)
+                if self.pending:
+                    ui.button("Stop", on_click=self.stop).props("outline no-caps")
+                else:
+                    ui.button("Send", on_click=self.send).props("unelevated no-caps").set_enabled(not self.busy)
+
+    def set_notice(self, text: str):
+        self.notice = text
+        self.composer.refresh()
+
+    # ---------- right panel
+
+    def toggle_right(self, kind: str | None):
+        self.right = None if self.right == kind or kind is None else kind
+        if self.right in ("files", "context"):
+            self.fs_selected = set()
+            self.fs_path = self.project["folder"] if self.project else None
+        width = 520 if self.right == "source" else 320
+        self.drawer.props(f"width={width}")
+        self.drawer.set_value(self.right is not None)
+        self.right_panel.refresh()
+        self.topbar.refresh()
+
+    @ui.refreshable
+    def right_panel(self):
+        if self.right in ("files", "context"):
+            self.files_panel()
+        elif self.right == "source" and self.source:
+            self.source_panel()
+
+    def panel_head(self, title: str):
+        with ui.row().classes("w-full items-center justify-between px-4 py-3 no-wrap") \
+                .style("border-bottom:1px solid var(--wb-border)"):
+            ui.label(title).classes("font-semibold")
+            ui.button(icon="close", on_click=lambda: self.toggle_right(None)).props("flat dense round size=sm")
+
+    def files_panel(self):
+        ctx = self.right == "context"
+        root_locked = bool(self.project)
+        with ui.column().classes("w-full h-full no-wrap gap-0"):
+            self.panel_head("Add to project context" if ctx else "Project files" if self.project else "Files")
+            with ui.scroll_area().classes("grow w-full"):
+                if self.fs_path is None:
+                    ui.label("Allowed folders").classes("muted text-xs px-2")
+                    roots = fs.roots()
+                    if not roots:
+                        ui.label("No folders yet — add one in Settings → Folders.").classes("muted text-xs px-2")
+                    for r in roots:
+                        with ui.element("div").classes(f"fs-row {'click' if r['exists'] else 'fs-off'}") \
+                                .on("click", lambda p=r["path"], ok=r["exists"]: ok and self.fs_open(p)):
+                            ui.icon("folder", size="xs").classes("muted")
+                            ui.label(r["name"]).classes("ellipsis1 grow")
+                            if not r["exists"]:
+                                ui.label("missing").classes("muted text-xs")
+                else:
+                    try:
+                        listing = fs.list_dir(self.fs_path, [self.project["folder"]] if self.project else None)
+                    except Exception as e:
+                        ui.label(str(e)).classes("err text-xs px-2")
+                        return
+                    with ui.row().classes("gap-1 items-center px-2 pb-2 text-xs"):
+                        if not root_locked:
+                            ui.button("Folders", on_click=lambda: self.fs_open(None)).props("flat dense no-caps size=sm")
+                            ui.label("/")
+                        ui.button(Path(listing["root"]).name, on_click=lambda: self.fs_open(listing["root"])) \
+                            .props("flat dense no-caps size=sm")
+                        rel = listing["path"][len(listing["root"]):].lstrip("/\\")
+                        if rel:
+                            ui.label(f"/ {rel}").classes("muted wrap-anywhere")
+                    if listing["parent"]:
+                        with ui.element("div").classes("fs-row click").on("click", lambda: self.fs_open(listing["parent"])):
+                            ui.icon("arrow_upward", size="xs").classes("muted")
+                            ui.label("..")
+                    if not listing["entries"]:
+                        ui.label("Empty folder.").classes("muted text-xs px-2")
+                    for e in listing["entries"]:
+                        if e["is_dir"]:
+                            with ui.element("div").classes("fs-row click").on("click", lambda p=e["path"]: self.fs_open(p)):
+                                ui.icon("folder", size="xs").classes("muted")
+                                ui.label(e["name"]).classes("ellipsis1")
+                        else:
+                            with ui.element("div").classes(f"fs-row {'' if e['supported'] else 'fs-off'}"):
+                                ui.checkbox(value=e["path"] in self.fs_selected,
+                                            on_change=lambda ev, p=e["path"]: self.fs_toggle(p, ev.value)) \
+                                    .props("dense").set_enabled(e["supported"])
+                                type_badge(e["name"])
+                                ui.label(e["name"]).classes("ellipsis1 grow").tooltip(e["name"])
+                                ui.label(file_size(e["size"])).classes("muted text-xs")
+            with ui.column().classes("w-full p-3 gap-1").style("border-top:1px solid var(--wb-border)"):
+                n = len(self.fs_selected)
+                label = ("Add to context" if ctx else "Attach to chat") + (f" ({n})" if n else "")
+                ui.button("Parsing…" if self.busy else label, on_click=self.fs_attach) \
+                    .props("unelevated no-caps").classes("w-full").set_enabled(bool(n) and not self.busy)
+                ui.label("PDF, Word, Text, Markdown" + (" · limited to the project folder" if self.project else "")) \
+                    .classes("muted text-xs")
+
+    def fs_open(self, path):
+        self.fs_path = path
+        self.right_panel.refresh()
+
+    def fs_toggle(self, path, on):
+        (self.fs_selected.add if on else self.fs_selected.discard)(path)
+        self.right_panel.refresh()
+
+    async def fs_attach(self):
+        paths = sorted(self.fs_selected)
+        self.busy = True
+        self.right_panel.refresh()
+        try:
+            if self.right == "context" and self.project:
+                metas = await asyncio.to_thread(projects.add_paths, self.project["id"], paths)
+                self.project_notice = report(metas)
+                self.reload_project()
+                self.main.refresh()
+            else:
+                metas = await asyncio.to_thread(self.ingest_paths, paths)
+                self.attach_metas(metas)
+            self.fs_selected = set()
+        finally:
+            self.busy = False
+            self.right_panel.refresh()
+
+    def ingest_paths(self, paths):
+        roots = [self.project["folder"]] if self.project else None
+        out = []
+        for path in paths:
+            try:
+                out.append({"ok": True, **documents.meta(documents.ingest(fs.check(path, roots)))})
+            except Exception as e:
+                out.append({"ok": False, "name": Path(path).name, "error": str(e)})
+        return out
+
+    # ---------- source panel (M2)
+
+    def open_source(self, cid: str, claim: str):
+        entry, doc, block = self.resolve(cid)
+        if not block:
+            return
+        loc = documents.locate(entry["doc_id"], block["id"], claim)
+        self.source = {"doc_id": entry["doc_id"], "label": cid, "block_id": block["id"], "claim": claim,
+                       "loc": loc, "page": block["page"], "zoom": 1.0}
+        self.right = None
+        self.toggle_right("source")
+
+    def source_panel(self):
+        s, loc = self.source, self.source["loc"]
+        is_pdf = loc["kind"] == "pdf"
+        with ui.column().classes("w-full h-full no-wrap gap-0"):
+            with ui.row().classes("w-full items-center justify-between px-4 py-3 no-wrap") \
+                    .style("border-bottom:1px solid var(--wb-border)"):
+                with ui.row().classes("items-center gap-2"):
+                    ui.label("Source").classes("font-semibold")
+                    ui.html(f'<span class="cite" style="cursor:default">{html.escape(s["label"])}</span>')
+                ui.button(icon="close", on_click=lambda: self.toggle_right(None)).props("flat dense round size=sm")
+
+            with ui.column().classes("w-full px-4 py-2 gap-1").style("border-bottom:1px solid var(--wb-border)"):
+                with ui.row().classes("items-center gap-2 no-wrap w-full"):
+                    type_badge(loc["name"])
+                    ui.label(loc["name"]).classes("font-medium ellipsis1")
+                if is_pdf:
+                    with ui.row().classes("items-center gap-1"):
+                        ui.button(icon="chevron_left", on_click=lambda: self.source_page(-1)) \
+                            .props("flat dense round size=sm").set_enabled(s["page"] > 1)
+                        ui.label(f"Page {s['page']} / {loc['pages']}").classes("text-xs")
+                        ui.button(icon="chevron_right", on_click=lambda: self.source_page(1)) \
+                            .props("flat dense round size=sm").set_enabled(s["page"] < loc["pages"])
+                        ui.separator().props("vertical").classes("mx-1")
+                        ui.button(icon="remove", on_click=lambda: self.source_zoom(-0.5)) \
+                            .props("flat dense round size=sm").set_enabled(s["zoom"] > 1)
+                        ui.label("Fit" if s["zoom"] == 1 else f"{int(s['zoom'] * 100)}%").classes("text-xs w-9 text-center")
+                        ui.button(icon="add", on_click=lambda: self.source_zoom(0.5)) \
+                            .props("flat dense round size=sm").set_enabled(s["zoom"] < 3)
+                        if s["page"] != loc["block"]["page"]:
+                            ui.button("Back to cited page", on_click=lambda: self.source_page(0)) \
+                                .props("flat dense no-caps size=sm color=primary")
+
+            with ui.column().classes("w-full px-4 py-2 gap-1 quote").style(
+                    "border-bottom:1px solid var(--wb-border);max-height:30%;overflow-y:auto;flex:0 0 auto"):
+                b = loc["block"]
+                where = f"page {b['page']}" if is_pdf else f"block {b['id']}"
+                cont = " (continues on next page)" if len({r[0] for r in b["rects"]}) > 1 else ""
+                ui.label(f"{b['heading'] + ' · ' if b['heading'] else ''}{where}{cont}").classes("muted text-xs")
+                ui.html(marked(b["text"], loc["sentence_spans"])).classes("text-[13px] leading-relaxed")
+                if s["claim"] and not loc["sentences"] and b["type"] == "paragraph":
+                    ui.label("No single sentence matched the claim, so the whole paragraph is highlighted.") \
+                        .classes("muted text-xs")
+
+            if is_pdf:
+                area = ui.scroll_area().classes("grow w-full pdf-scroll")
+                with area:
+                    url = (f"/api/documents/{s['doc_id']}/page/{s['page']}.png?zoom={min(4, 1.5 * s['zoom'])}"
+                           f"&block={quote(s['block_id'])}&claim={quote(s['claim'][:800])}")
+                    img = ui.image(url).classes("shadow").style(f"width:{int(100 * s['zoom'])}%;max-width:none")
+                if s["page"] == b["page"]:
+                    ys = [r[2] for r in (loc["sentence_rects"] or b["rects"]) if r[0] == s["page"] - 1]
+                    size = loc["page_sizes"].get(str(s["page"] - 1)) or loc["page_sizes"].get(s["page"] - 1)
+                    if ys and size:
+                        frac = max(0.0, min(1.0, (min(ys) - 120) / size[1]))
+                        img.on("load", lambda: area.scroll_to(percent=frac))
+            else:
+                doc = self.doc(s["doc_id"])
+                parts = []
+                for blk in doc["blocks"]:
+                    if blk["type"] == "heading":
+                        parts.append(f'<div class="tb-h">{html.escape(blk["text"])}</div>')
+                        continue
+                    cited = blk["id"] == b["id"]
+                    body = marked(blk["text"], loc["sentence_spans"]) if cited else html.escape(blk["text"])
+                    parts.append(f'<div id="tb-{blk["id"]}" class="tb {"cited" if cited else ""} '
+                                 f'{"tb-table" if blk["type"] == "table" else ""}"><span class="tb-id">{blk["id"]}</span>{body}</div>')
+                with ui.scroll_area().classes("grow w-full pdf-scroll"):
+                    ui.html(f'<div class="text-view">{"".join(parts)}</div>')
+                ui.timer(0.3, lambda: self.client.run_javascript(
+                    f"document.getElementById('tb-{b['id']}')?.scrollIntoView({{block:'center'}})"), once=True)
+
+    def source_page(self, delta: int):
+        s = self.source
+        s["page"] = s["loc"]["block"]["page"] if delta == 0 else max(1, min(s["loc"]["pages"], s["page"] + delta))
+        self.right_panel.refresh()
+
+    def source_zoom(self, delta: float):
+        self.source["zoom"] = max(1.0, min(3.0, self.source["zoom"] + delta))
+        self.right_panel.refresh()
+
+    # ---------- navigation
+
+    def refresh_all(self):
+        self.sidebar.refresh()
+        self.topbar.refresh()
+        self.main.refresh()
+        self.composer.refresh()
+
+    def open_project(self, pid: str | None):
+        if self.pending:
+            return
+        self.chat, self.notice, self.project_notice = None, "", ""
+        try:
+            self.project = projects.get(pid) if pid else None
+        except FileNotFoundError as e:
+            ui.notify(str(e), type="negative")
+            self.project = None
+        if self.right:
+            self.toggle_right(None)
+        self.refresh_all()
+
+    def open_chat(self, cid: str):
+        if self.pending:
+            return
+        self.chat, self.notice = chats.get(cid), ""
+        if self.right in ("context", "source"):
+            self.toggle_right(None)
+        self.refresh_all()
+
+    def new_chat(self):
+        if self.pending:
+            return
+        self.notice = ""
+        self.chat = chats.create(self.project["id"]) if self.project else None
+        if self.right == "context":
+            self.toggle_right(None)
+        self.refresh_all()
+
+    def ensure_chat(self) -> dict:
+        if not self.chat:
+            self.chat = chats.create(self.project["id"] if self.project else None)
+        return self.chat
+
+    async def confirm(self, message: str, ok: str = "OK") -> bool:
+        with self.root:
+            return await confirm(message, ok)
+
+    async def delete_chat(self, cid: str):
+        if not await self.confirm("Delete this chat? Attached files are not deleted.", "Delete"):
+            return
+        chats.delete(cid)
+        if self.chat and self.chat["id"] == cid:
+            self.chat = None
+        self.refresh_all()
+
+    # ---------- attachments
+
+    def attach_metas(self, metas: list[dict]):
+        self.notice = report(metas, "Attached")
+        good = [m["id"] for m in metas if m.get("ok")]
+        if good:
+            chat = self.ensure_chat()
+            chats.attach(chat, good)
+            chats.save(chat)
+        self.refresh_all()
+
+    def detach(self, doc_id: str):
+        chats.detach(self.chat, doc_id)
+        chats.save(self.chat)
+        self.refresh_all()
+
+    async def on_chat_upload(self, e: events.MultiUploadEventArguments):
+        e.sender.run_method("reset")
+        self.busy = True
+        self.composer.refresh()
+        try:
+            metas = await asyncio.to_thread(self.save_uploads, [(n, c.read()) for n, c in zip(e.names, e.contents)])
+            self.attach_metas(metas)
+        finally:
+            self.busy = False
+            self.composer.refresh()
+
+    @staticmethod
+    def save_uploads(items) -> list[dict]:
+        out = []
+        for name, data in items:
+            name = Path(name).name
+            if not supported(name):
+                out.append({"ok": False, "name": name, "error": "unsupported file type"})
+                continue
+            safe = re.sub(r"[^\w.\- ]", "_", name)
+            dest = settings.UPLOADS_DIR / f"{time.time_ns() % 10**10}_{safe}"
+            dest.write_bytes(data)
+            try:
+                out.append({**documents.meta(documents.ingest(dest, name=name)), "ok": True, "name": name})
+            except Exception as ex:
+                out.append({"ok": False, "name": name, "error": str(ex)})
+        return out
+
+    # ---------- sending
+
+    async def send(self):
+        text = (self.input.value or "").strip()
+        if not text or self.pending:
+            return
+        chat = self.ensure_chat()
+        p = settings.provider()
+        project = projects.get(chat["project_id"]) if chat.get("project_id") else None
+        messages, info = chats.build_messages(chat, text, p.get("context_tokens", 8192), project)
+        chat["messages"].append({"role": "user", "content": text, "created": time.time()})
+        if chat["title"] == "New chat":
+            chat["title"] = re.sub(r"\s+", " ", text)[:60]
+        chats.save(chat)
+
+        self.pending, self.notice = True, ""
+        self.sidebar.refresh()
+        self.topbar.refresh()
+        self.main.refresh()            # shows the user message
+        self.composer.refresh()        # Stop button
+        with self.msg_col:
+            with ui.column().classes("answer w-full gap-1"):
+                status = ui.label().classes("muted")
+                md = ui.markdown("")
+        parts: list[str] = []
+        t0 = time.time()
+        docs_note = f" {info['docs']} document(s)" if info["docs"] else ""
+
+        def tick():
+            if parts:
+                status.set_visibility(False)
+                md.set_content(render_answer("".join(parts), self.resolve))
+            else:
+                status.set_text(f"Reading{docs_note} (~{info['prompt_tokens_est']:,} tokens)… {int(time.time() - t0)}s")
+            self.client.run_javascript("window.scrollTo(0, document.body.scrollHeight)")
+
+        tick()
+        with self.msg_col:
+            timer = ui.timer(0.25, tick)
+
+        async def run():
+            async for chunk in llm.stream_chat(messages, p):
+                parts.append(chunk)
+
+        error = None
+        self.task = asyncio.create_task(run())
+        try:
+            await self.task
+        except asyncio.CancelledError:
+            pass
+        except llm.LLMError as e:
+            error = str(e)
+        except Exception as e:                  # keep the UI usable whatever happens
+            error = f"{type(e).__name__}: {e}"
+        finally:
+            timer.cancel()
+            self.task = None
+            if parts or error:
+                msg = {"role": "assistant", "content": "".join(parts), "created": time.time(),
+                       "model": p["model"], "context": info}
+                if error:
+                    msg["error"] = error
+                fresh = chats.get(chat["id"])
+                fresh["messages"].append(msg)
+                chats.save(fresh)
+            self.chat = chats.get(chat["id"])
+            self.pending = False
+            self.refresh_all()
+            self.client.run_javascript("window.scrollTo(0, document.body.scrollHeight)")
+
+    def stop(self):
+        if self.task:
+            self.task.cancel()
+
+    async def save_to_folder(self, m: dict):
+        with self.root:
+            name = await ask_text(f"Save this answer in the project folder as:\n{self.project['folder']}",
+                                  f"{slug(self.chat['title'])}.md", "Save")
+        if not name:
+            return
+        try:
+            path = projects.write_output(self.project["id"], name, m["content"])
+        except FileExistsError:
+            if not await self.confirm(f"{name} already exists. Overwrite it?", "Overwrite"):
+                return
+            path = projects.write_output(self.project["id"], name, m["content"], overwrite=True)
+        except Exception as e:
+            ui.notify(str(e), type="negative")
+            return
+        self.set_notice(f"Saved to {path}")
+
+    # ---------- project page
+
+    def project_view(self):
+        p = self.project
+        with ui.column().classes("w-full max-w-[820px] mx-auto gap-4 pb-8"):
+            with ui.column().classes("gap-0 w-full"):
+                name = ui.input(value=p["name"]).props("borderless dense input-class='text-2xl font-semibold'").classes("w-full")
+                name.on("blur", lambda: self.rename_project(name.value))
+                name.on("keydown.enter", lambda: self.rename_project(name.value))
+                with ui.row().classes("items-center gap-1 muted text-xs no-wrap"):
+                    ui.icon("folder", size="xs")
+                    ui.html(f"<code class='wrap-anywhere'>{html.escape(p['folder'])}</code>")
+                    ui.tooltip("The assistant can only read and write inside this folder")
+
+            with ui.column().classes("card gap-2"):
+                with ui.row().classes("w-full items-baseline justify-between"):
+                    ui.label("Instructions").classes("font-semibold text-[15px]")
+                    ui.label("Applied to every chat in this project").classes("muted text-xs")
+                instr = ui.textarea(value=p["instructions"], placeholder="Describe the task, e.g. how summaries should "
+                                    "be structured, their length and tone…").props("outlined autogrow").classes("w-full")
+                with ui.row().classes("w-full justify-end"):
+                    ui.button("Save instructions", on_click=lambda: self.save_instructions(instr.value)) \
+                        .props("unelevated no-caps")
+
+            with ui.column().classes("card gap-2"):
+                with ui.row().classes("w-full items-baseline justify-between"):
+                    ui.label("Context").classes("font-semibold text-[15px]")
+                    ui.label("Background documents included in every chat, cited as C1, C2…").classes("muted text-xs")
+                if not p["context"]:
+                    ui.label("No context yet.").classes("muted text-xs")
+                source_label = {"folder": "from folder", "upload": "uploaded", "text": "pasted"}
+                for c in p["context"]:
+                    d = self.doc(c["doc_id"])
+                    with ui.row().classes("w-full items-center gap-3 no-wrap py-1").style("border-bottom:1px solid var(--wb-border)"):
+                        ui.label(c["label"]).classes("font-bold w-7").style("color:var(--wb-accent)")
+                        type_badge(c["name"])
+                        ui.label(c["name"]).classes("ellipsis1 grow").tooltip(c["path"])
+                        pages = f"{d['pages']} pages · " if d and d["kind"] == "pdf" else ""
+                        ui.label(pages + source_label[c["source"]]).classes("muted text-xs")
+                        ui.button(icon="close", on_click=lambda c=c: self.remove_context(c)).props("flat dense round size=xs")
+                with ui.row().classes("gap-2 items-center"):
+                    up = ui.upload(multiple=True, auto_upload=True, on_multi_upload=self.on_context_upload, on_rejected=rejected) \
+                        .props(f'accept="{ACCEPT}"').classes("hidden")
+                    ui.button("Upload files…", on_click=lambda: up.run_method("pickFiles")).props("outline no-caps")
+                    ui.button("Add from project folder…", on_click=lambda: self.toggle_right("context")) \
+                        .props("outline no-caps")
+                    ui.button("Paste text…", on_click=self.paste_dialog).props("outline no-caps")
+                    if self.busy:
+                        ui.spinner(size="sm")
+                if self.project_notice:
+                    with ui.row().classes("notice items-start justify-between no-wrap"):
+                        ui.label(self.project_notice).classes("whitespace-pre-wrap")
+                        ui.button(icon="close", on_click=lambda: self.set_project_notice("")) \
+                            .props("flat dense round size=xs")
+
+            with ui.column().classes("card gap-1"):
+                with ui.row().classes("w-full items-center justify-between"):
+                    ui.label("Chats").classes("font-semibold text-[15px]")
+                    ui.button("+ New chat in project", on_click=self.new_chat).props("unelevated no-caps")
+                clist = chats.list_all(p["id"])
+                if not clist:
+                    ui.label("No chats yet.").classes("muted text-xs")
+                for c in clist:
+                    with ui.element("div").classes("fs-row click").on("click", lambda cid=c["id"]: self.open_chat(cid)):
+                        ui.label(c["title"]).classes("ellipsis1 grow")
+                        ui.label(time.strftime("%Y-%m-%d %H:%M", time.localtime(c["updated"]))).classes("muted text-xs")
+
+            with ui.row().classes("w-full justify-end"):
+                ui.button("Remove project from app", on_click=self.remove_project) \
+                    .props("flat dense no-caps size=sm color=negative")
+
+    def set_project_notice(self, text: str):
+        self.project_notice = text
+        self.main.refresh()
+
+    def rename_project(self, name: str):
+        if name.strip() and name != self.project["name"]:
+            self.project = projects.update(self.project["id"], name=name)
+            self.sidebar.refresh()
+            self.topbar.refresh()
+
+    def save_instructions(self, text: str):
+        self.project = projects.update(self.project["id"], instructions=text)
+        ui.notify("Instructions saved", type="positive")
+
+    async def remove_context(self, c: dict):
+        msg = (f"Remove {c['name']} from context? The file stays in the folder." if c["source"] == "folder"
+               else f"Remove {c['name']} from context? Its copy in .workbench/context is deleted.")
+        if await self.confirm(msg, "Remove"):
+            self.project = projects.remove_context(self.project["id"], c["doc_id"])
+            self.main.refresh()
+
+    async def on_context_upload(self, e: events.MultiUploadEventArguments):
+        e.sender.run_method("reset")
+        items = [(n, c.read()) for n, c in zip(e.names, e.contents)]
+        self.busy = True
+        self.main.refresh()
+        try:
+            metas = await asyncio.to_thread(lambda: [projects.add_upload(self.project["id"], n, d) for n, d in items])
+            self.project_notice = report(metas, "Uploaded")
+            self.reload_project()
+        finally:
+            self.busy = False
+            self.main.refresh()
+            self.composer.refresh()
+
+    async def paste_dialog(self):
+        with self.root, ui.dialog() as dialog, ui.card().classes("w-[560px] max-w-full"):
+            ui.label("Paste text into project context").classes("font-semibold")
+            title = ui.input("Title (optional)").classes("w-full").props("outlined dense")
+            text = ui.textarea("Text").classes("w-full").props("outlined autogrow input-style='min-height:160px'")
+            with ui.row().classes("w-full justify-end"):
+                ui.button("Cancel", on_click=lambda: dialog.submit(None)).props("flat no-caps")
+                ui.button("Add to context", on_click=lambda: dialog.submit((title.value, text.value))) \
+                    .props("unelevated no-caps")
+        result = await dialog
+        dialog.delete()
+        if result and result[1].strip():
+            meta = projects.add_text(self.project["id"], result[0] or "Pasted text", result[1])
+            self.project_notice = report([meta])
+            self.reload_project()
+            self.main.refresh()
+
+    async def remove_project(self):
+        p = self.project
+        if await self.confirm(f'Remove "{p["name"]}" from the app? Its chats are deleted. The folder and its .workbench data '
+                         "stay on disk, so you can reopen it later by creating a project on the same folder.", "Remove"):
+            chats.delete_project_chats(p["id"])
+            projects.forget(p["id"])
+            self.open_project(None)
+
+    # ---------- new project dialog
+
+    async def new_project_dialog(self):
+        state = {"picking": False, "listing": None, "files": [], "error": ""}
+
+        with self.root, ui.dialog().props("persistent") as dialog, ui.card().classes("w-[700px] max-w-full gap-3"):
+            with ui.row().classes("w-full items-center justify-between"):
+                ui.label("New project").classes("font-semibold text-base")
+                ui.button(icon="close", on_click=lambda: dialog.submit(None)).props("flat dense round size=sm")
+            name = ui.input("Name", placeholder="e.g. CIP monthly summaries").classes("w-full").props("outlined dense")
+            ui.label("Folder — the assistant can only read files in this folder and save outputs here") \
+                .classes("muted text-xs")
+            with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                folder = ui.input(placeholder="/Users/you/Documents/cip  or  C:\\Work\\cip").classes("grow") \
+                    .props("outlined dense")
+                ui.button("Browse…", on_click=lambda: toggle_picker()).props("outline no-caps")
+
+            @ui.refreshable
+            def picker():
+                if not state["picking"]:
+                    return
+                lst = state["listing"]
+                with ui.column().classes("w-full gap-0").style(
+                        "border:1px solid var(--wb-border);border-radius:9px;background:var(--wb-bg)"):
+                    if state["error"]:
+                        ui.label(state["error"]).classes("err text-xs p-2")
+                    if not lst:
+                        return
+                    with ui.row().classes("w-full items-center gap-1 p-2 no-wrap").style("border-bottom:1px solid var(--wb-border)"):
+                        ui.button(icon="arrow_upward", on_click=lambda: browse(lst["parent"])) \
+                            .props("outline dense size=sm").tooltip("Up one level").set_enabled(bool(lst["parent"]))
+                        ui.button("Home", on_click=lambda: browse(lst["home"])).props("outline dense no-caps size=sm")
+                        ui.label(lst["path"]).classes("text-xs muted ellipsis1").style("direction:rtl;text-align:left")
+                    with ui.scroll_area().classes("w-full h-56"):
+                        if not lst["dirs"] and not lst["files"]:
+                            ui.label("This folder is empty.").classes("muted text-xs p-2")
+                        for d in lst["dirs"]:
+                            with ui.element("div").classes("fs-row click").on("click", lambda p=d["path"]: browse(p)) \
+                                    .on("dblclick", lambda p=d["path"]: pick(p)):
+                                ui.icon("folder", size="xs").classes("muted")
+                                ui.label(d["name"]).classes("ellipsis1 grow")
+                                if d["is_project"]:
+                                    ui.badge("project").props("outline")
+                        for f in lst["files"]:
+                            with ui.element("div").classes(f"fs-row {'' if f['supported'] else 'fs-off'}"):
+                                type_badge(f["name"])
+                                ui.label(f["name"]).classes("ellipsis1 grow")
+                                ui.label(file_size(f["size"])).classes("muted text-xs")
+                    with ui.row().classes("w-full items-center gap-2 p-2").style("border-top:1px solid var(--wb-border)"):
+                        nd, nf = len(lst["dirs"]), len(lst["files"])
+                        readable = sum(f["supported"] for f in lst["files"])
+                        ui.button("Use this folder", on_click=lambda: pick(lst["path"])).props("unelevated no-caps dense")
+                        ui.label(f"{nd} folder{'s' if nd != 1 else ''} · {nf} file{'s' if nf != 1 else ''}"
+                                 + (f" ({readable} readable)" if nf else "") + " · double-click a folder to pick it") \
+                            .classes("muted text-xs")
+
+            def browse(path):
+                try:
+                    state["listing"], state["error"] = fs.list_dirs(path), ""
+                except Exception as e:
+                    state["error"] = str(e)
+                picker.refresh()
+
+            def toggle_picker():
+                state["picking"] = not state["picking"]
+                if state["picking"]:
+                    browse(folder.value.strip() or None)
+                picker.refresh()
+
+            def pick(path):
+                folder.value = path
+                state["picking"] = False
+                picker.refresh()
+
+            picker()
+            create_folder = ui.checkbox("Create the folder if it doesn't exist", value=True).props("dense")
+            instructions = ui.textarea("Instructions — what should the assistant do in this project?",
+                                       placeholder=INSTRUCTIONS_HINT).classes("w-full") \
+                .props("outlined autogrow input-style='min-height:130px'")
+
+            ui.label("Context — optional background the assistant always sees: sample summaries, glossaries, templates…") \
+                .classes("muted text-xs")
+
+            @ui.refreshable
+            def upload_list():
+                files = state["files"]
+                if files:
+                    ok = sum(supported(n) for n, _ in files)
+                    ui.label(f"{ok} of {len(files)} file(s) will be added when you create the project").classes("muted text-xs")
+                    with ui.column().classes("w-full gap-0").style("border:1px solid var(--wb-border);border-radius:8px"):
+                        for i, (n, data) in enumerate(files):
+                            good = supported(n)
+                            with ui.row().classes("w-full items-center gap-3 px-3 py-1 no-wrap").style(
+                                    "border-bottom:1px solid var(--wb-border)" + ("" if good else
+                                    ";background:color-mix(in srgb, var(--wb-error) 8%, transparent)")):
+                                type_badge(n)
+                                ui.label(n).classes("ellipsis1 grow")
+                                ui.label(file_size(len(data))).classes("muted text-xs")
+                                ui.label("✓ ready" if good else "unsupported type").classes(
+                                    "text-xs " + ("text-green-700" if good else "err"))
+                                ui.button(icon="close", on_click=lambda i=i: (state["files"].pop(i), upload_list.refresh())) \
+                                    .props("flat dense round size=xs")
+
+            def on_pick(e: events.MultiUploadEventArguments):
+                e.sender.run_method("reset")
+                have = {(n, len(d)) for n, d in state["files"]}
+                for n, c in zip(e.names, e.contents):
+                    data = c.read()
+                    if (n, len(data)) not in have:
+                        state["files"].append((n, data))
+                upload_list.refresh()
+
+            up = ui.upload(multiple=True, auto_upload=True, on_multi_upload=on_pick, on_rejected=rejected).props(f'accept="{ACCEPT}"') \
+                .classes("hidden")
+            ui.button("Upload files…", on_click=lambda: up.run_method("pickFiles")).props("outline no-caps")
+            upload_list()
+            paste_title = ui.input("Title for pasted text (optional)").classes("w-full").props("outlined dense")
+            paste_text = ui.textarea("…or paste text here").classes("w-full").props("outlined autogrow")
+            ui.label("You can add more context and files from the project folder later.").classes("muted text-xs")
+            error = ui.label().classes("err text-xs")
+            with ui.row().classes("w-full justify-end"):
+                ui.button("Cancel", on_click=lambda: dialog.submit(None)).props("flat no-caps")
+                create_btn = ui.button("Create project", on_click=lambda: dialog.submit("create")).props("unelevated no-caps")
+            create_btn.bind_enabled_from(folder, "value", backward=lambda v: bool((v or "").strip()))
+
+        while True:
+            if await dialog != "create":
+                dialog.delete()
+                return
+            try:
+                p = projects.create(name.value or Path(folder.value.strip()).name, folder.value.strip(),
+                                    instructions.value or "", create_folder.value)
+                break
+            except Exception as e:
+                error.set_text(str(e))
+
+        dialog.delete()
+        lines = []
+        if p.get("reopened"):
+            lines.append(f'This folder already had a project, so "{p["name"]}" was reopened with its saved '
+                         "instructions and context.")
+        added = [projects.add_upload(p["id"], n, d) for n, d in state["files"] if supported(n)]
+        if (paste_text.value or "").strip():
+            added.append(projects.add_text(p["id"], paste_title.value or "Pasted text", paste_text.value))
+        if added:
+            lines.append(report(added, "Added to context"))
+        self.open_project(p["id"])
+        self.set_project_notice("\n".join(lines))
+
+    # ---------- settings dialog
+
+    async def settings_dialog(self):
+        s = settings.load()
+        draft = {name: {k: v for k, v in p.items() if k != "api_key"} for name, p in s["providers"].items()}
+        keys = {name: "" for name in draft}
+        folders = list(s["allowed_folders"])
+        active = {"name": s["active_provider"]}
+
+        with self.root, ui.dialog() as dialog, ui.card().classes("w-[600px] max-w-full"):
+            with ui.row().classes("w-full items-center justify-between"):
+                ui.label("Settings").classes("font-semibold text-base")
+                ui.button(icon="close", on_click=dialog.close).props("flat dense round size=sm")
+            with ui.tabs().classes("w-full").props("dense align=left no-caps") as tabs:
+                tab_objs = {name: ui.tab(name, label=p["label"]) for name, p in draft.items()}
+                ui.tab("_folders", label="Folders")
+            with ui.tab_panels(tabs, value=tab_objs[active["name"]]).classes("w-full"):
+                for name, p in draft.items():
+                    with ui.tab_panel(name).classes("gap-2 px-0"):
+                        self.provider_form(name, p, keys, active)
+                with ui.tab_panel("_folders").classes("gap-2 px-0"):
+                    ui.label("The file browser can only read inside these folders (subfolders included).") \
+                        .classes("muted text-xs")
+
+                    @ui.refreshable
+                    def folder_list():
+                        for f in folders:
+                            with ui.row().classes("w-full items-center no-wrap gap-2"):
+                                ui.html(f"<code class='wrap-anywhere'>{html.escape(f)}</code>").classes("grow")
+                                ui.button("Remove", on_click=lambda f=f: (folders.remove(f), folder_list.refresh())) \
+                                    .props("outline dense no-caps size=sm")
+                    folder_list()
+                    with ui.row().classes("w-full no-wrap gap-2"):
+                        new = ui.input(placeholder="/Users/you/Documents/memos  or  C:\\Work\\memos").classes("grow") \
+                            .props("outlined dense")
+
+                        def add_folder():
+                            if new.value.strip():
+                                folders.append(new.value.strip())
+                                new.value = ""
+                                folder_list.refresh()
+                        ui.button("Add", on_click=add_folder).props("outline no-caps")
+
+            def save():
+                body = {"active_provider": active["name"], "allowed_folders": folders,
+                        "providers": {n: {**p, "api_key": keys[n]} for n, p in draft.items()}}
+                settings.update(body)
+                self.sidebar.refresh()
+                self.topbar.refresh()
+
+            self._settings_save = save
+            with ui.row().classes("w-full justify-end"):
+                ui.button("Cancel", on_click=dialog.close).props("flat no-caps")
+                ui.button("Save", on_click=lambda: (save(), dialog.close())).props("unelevated no-caps")
+        dialog.on("hide", dialog.delete)
+        dialog.open()
+
+    def provider_form(self, name: str, p: dict, keys: dict, active: dict):
+        ui.select({"ollama": "Ollama (native API)", "openai": "OpenAI-compatible"}, label="Type", value=p["type"]) \
+            .bind_value(p, "type").classes("w-full").props("outlined dense")
+        ui.input("Base URL", placeholder="http://localhost:11434" if p["type"] == "ollama" else "https://gateway/v1") \
+            .bind_value(p, "base_url").classes("w-full").props("outlined dense")
+        with ui.row().classes("w-full no-wrap gap-2 items-center"):
+            model = ui.input("Model").bind_value(p, "model").classes("grow").props("outlined dense")
+
+            async def list_models():
+                try:
+                    names = await llm.list_models({**settings.provider(name), **p, "api_key": keys[name] or settings.provider(name).get("api_key", "")})
+                    model.set_autocomplete(names)
+                    ui.notify(f"{len(names)} models: " + ", ".join(names[:8]) + ("…" if len(names) > 8 else ""))
+                except llm.LLMError as e:
+                    ui.notify(str(e), type="negative", multi_line=True)
+            ui.button("List", on_click=list_models).props("outline no-caps")
+        ui.input("API key" + (" (stored — leave blank to keep)" if p.get("has_api_key") or settings.provider(name).get("api_key") else ""),
+                 password=True, password_toggle_button=True,
+                 on_change=lambda e: keys.__setitem__(name, e.value or "")).classes("w-full").props("outlined dense autocomplete=off")
+        headers = ui.input("Extra headers (JSON; {api_key} is replaced by the key)",
+                           value=json.dumps(p.get("extra_headers") or {})).classes("w-full").props("outlined dense")
+
+        def set_headers(e):
+            try:
+                p["extra_headers"] = json.loads(e.value or "{}")
+                headers.props(remove="error")
+            except ValueError:
+                headers.props("error error-message='Invalid JSON'")
+        headers.on_value_change(set_headers)
+        with ui.row().classes("gap-4"):
+            ui.checkbox("Verify SSL").bind_value(p, "verify_ssl").props("dense")
+            ui.checkbox("Bypass proxy").bind_value(p, "bypass_proxy").props("dense")
+        with ui.row().classes("w-full no-wrap gap-2"):
+            ui.number("Context window (tokens)", min=1024, step=1024, format="%d") \
+                .bind_value(p, "context_tokens", forward=lambda v: int(v or 8192)).classes("grow").props("outlined dense")
+            ui.number("Temperature", min=0, max=2, step=0.1).bind_value(p, "temperature") \
+                .classes("grow").props("outlined dense")
+        result = ui.label().classes("text-xs whitespace-pre-wrap")
+        with ui.row().classes("gap-2"):
+            use = ui.button("Use this provider", on_click=lambda: (active.__setitem__("name", name), use.set_visibility(False))) \
+                .props("outline no-caps")
+            use.set_visibility(active["name"] != name)
+
+            async def test():
+                self._settings_save()
+                result.set_text("Testing…")
+                result.classes(replace="text-xs whitespace-pre-wrap muted")
+                t0 = time.time()
+                try:
+                    reply = await llm.complete([{"role": "user", "content": "Reply with exactly: OK"}],
+                                               {**settings.provider(name), "context_tokens": 512})
+                    result.set_text(f'✓ Replied "{reply.strip()[:80]}" in {time.time() - t0:.1f}s')
+                except llm.LLMError as e:
+                    result.set_text(f"✗ {e}")
+                    result.classes(replace="text-xs whitespace-pre-wrap err")
+            ui.button("Save & test connection", on_click=test).props("outline no-caps")
+
+
+def attach(app):
+    @ui.page("/")
+    def index():
+        Workbench().build()
+
+    ui.run_with(app, title="LLM Workbench", favicon="🗂️", show_welcome_message=False, reconnect_timeout=30)

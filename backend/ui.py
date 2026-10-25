@@ -46,6 +46,13 @@ body { background: var(--wb-bg); color: var(--wb-text); font-size: 14px; }
 .chip { display: inline-flex; align-items: center; gap: 4px; font-size: 12.5px; background: var(--wb-panel); border: 1px solid var(--wb-border); border-radius: 14px; padding: 1px 4px 1px 10px; }
 .chip b { color: var(--wb-accent); }
 .answer .nicegui-markdown p { margin: 0 0 10px; }
+.wb-resizer { position: absolute; top: 0; right: 0; width: 10px; height: 100%; cursor: col-resize; z-index: 3000; }
+.wb-resizer-right { left: 0; right: auto; }
+.wb-resizer:hover, body.wb-resizing .wb-resizer { background: var(--wb-accent); opacity: .35; }
+body.wb-resizing, body.wb-resizing * { cursor: col-resize !important; user-select: none !important; }
+.q-drawer__content { position: relative; }
+.user-msg .msg-actions { opacity: 0; transition: opacity .15s; }
+.user-msg:hover .msg-actions, .user-msg:focus-within .msg-actions { opacity: 1; }
 .answer .file-text { border-left: 3px solid var(--wb-accent-soft); padding-left: 12px; }
 .answer .nicegui-markdown table { border-collapse: collapse; }
 .answer .nicegui-markdown th, .answer .nicegui-markdown td { border: 1px solid var(--wb-border); padding: 3px 8px; }
@@ -80,6 +87,43 @@ document.addEventListener('click', (e) => {
   const c = e.target.closest('[data-cite]');
   if (c && c.dataset.ok) emitEvent('cite', {id: c.dataset.cite, claim: c.dataset.claim || ''});
 });
+</script>"""
+
+# Dragging the border of the sidebar or the right panel sends "resize_drawer" events to Python, which sets
+# the drawer width (Quasar then re-lays out the chat column). Widths are remembered in this browser.
+RESIZE_SCRIPT = """<script>
+(() => {
+  let drag = null, frame = 0;
+  const key = (side) => 'wb-width-' + side;
+  document.addEventListener('mousedown', (e) => {
+    const h = e.target.closest('.wb-resizer');
+    if (!h) return;
+    const drawer = h.closest('.q-drawer');
+    drag = {side: h.dataset.side, x: e.clientX, w: drawer.offsetWidth};
+    document.body.classList.add('wb-resizing');
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', (e) => {
+    if (!drag) return;
+    const dx = e.clientX - drag.x;
+    const w = Math.round(drag.side === 'left' ? drag.w + dx : drag.w - dx);
+    cancelAnimationFrame(frame);
+    frame = requestAnimationFrame(() => { drag.last = w; emitEvent('resize_drawer', {side: drag.side, width: w}); });
+  });
+  document.addEventListener('mouseup', () => {
+    if (!drag) return;
+    try { if (drag.last) localStorage.setItem(key(drag.side), drag.last); } catch (_) {}
+    drag = null;
+    document.body.classList.remove('wb-resizing');
+  });
+  window.addEventListener('load', () => setTimeout(() => {
+    for (const side of ['left', 'right']) {
+      let w = null;
+      try { w = localStorage.getItem(key(side)); } catch (_) {}
+      if (w) emitEvent('resize_drawer', {side: side, width: +w, initial: true});
+    }
+  }, 300));
+})();
 </script>"""
 
 INSTRUCTIONS_HINT = """Describe the task the assistant should perform in this project, e.g.
@@ -285,6 +329,9 @@ class Workbench:
         self.task: asyncio.Task | None = None
         self.busy = False
         self.docs: dict[str, dict] = {}
+        self.editing: int | None = None         # index of the user message being edited
+        self.left_width = 260                   # drawer widths in px, changed by dragging their borders
+        self.right_widths = {"source": 560, "files": 320}
 
     # ---------- feedback that survives refreshes
 
@@ -329,16 +376,22 @@ class Workbench:
         self.root = ui.element("div")
         ui.add_css(CSS)
         ui.add_body_html(CITE_SCRIPT)
+        ui.add_body_html(RESIZE_SCRIPT)
+        ui.on("resize_drawer", self.on_resize, throttle=0.03)
         ui.page_title("LLM Workbench")
         ui.dark_mode(None)                      # follow the system setting
         ui.on("cite", lambda e: self.open_source(e.args.get("id", ""), e.args.get("claim", "")))
 
-        with ui.left_drawer(value=True, fixed=True).props("width=260 bordered breakpoint=700").classes("p-3"):
+        self.left = ui.left_drawer(value=True, fixed=True).props(f"width={self.left_width} bordered breakpoint=700") \
+            .classes("p-3")
+        with self.left:
+            ui.element("div").classes("wb-resizer").props('data-side=left').tooltip("Drag to resize")
             self.sidebar()
         with ui.header().classes("wb-header items-center gap-3 px-4 py-2"):
             self.topbar()
         self.drawer = ui.right_drawer(value=False, fixed=True).props("bordered breakpoint=700").classes("rightpanel p-0")
         with self.drawer:
+            ui.element("div").classes("wb-resizer wb-resizer-right").props('data-side=right').tooltip("Drag to resize")
             self.right_panel()
         self.footer = ui.footer().classes("wb-footer px-4 pb-3 pt-1")
         with self.footer:
@@ -424,7 +477,7 @@ class Workbench:
         if self.project and not self.chat:
             self.project_view()
             return
-        self.msg_col = ui.column().classes("w-full max-w-[820px] mx-auto gap-4 pb-4")
+        self.msg_col = ui.column().classes("w-full max-w-[1100px] mx-auto gap-4 pb-4")
         with self.msg_col:
             if not self.chat or not self.chat["messages"]:
                 with ui.column().classes("w-full items-center text-center mt-[12vh] gap-2"):
@@ -438,13 +491,23 @@ class Workbench:
                         ui.label("Open Files to pick documents from your allowed folders, or use the 📎 button. "
                                  "Answers cite their sources — click a citation to see it highlighted in the original. "
                                  "For repeated tasks, create a project.").classes("muted max-w-[540px]")
-            for m in (self.chat["messages"] if self.chat else []):
-                self.render_message(m)
+            for i, m in enumerate(self.chat["messages"] if self.chat else []):
+                self.render_message(m, i)
 
-    def render_message(self, m: dict):
+    def render_message(self, m: dict, index: int | None = None):
         if m["role"] == "user":
-            with ui.row().classes("w-full justify-end"):
+            if index is not None and index == self.editing:
+                self.edit_box(m, index)
+                return
+            with ui.column().classes("w-full items-end gap-0 user-msg"):
                 ui.label(m["content"]).classes("bubble")
+                with ui.row().classes("msg-actions gap-0"):
+                    ui.button(icon="content_copy", on_click=lambda m=m: self.copy(m["content"])) \
+                        .props("flat dense round size=sm").tooltip("Copy")
+                    if index is not None:
+                        ui.button(icon="edit", on_click=lambda i=index: self.start_edit(i)) \
+                            .props("flat dense round size=sm").tooltip("Edit and resend from here") \
+                            .set_enabled(not self.pending)
             return
         with ui.column().classes("answer w-full gap-1"):
             parts = outputs.split_answer(m["content"])
@@ -464,6 +527,9 @@ class Workbench:
                 ui.label(f"⚠ {m['error']}").classes("err text-xs")
             with ui.row().classes("items-center gap-2 text-xs muted"):
                 ui.label(m.get("model", ""))
+                if m["content"]:
+                    ui.button(icon="content_copy", on_click=lambda m=m: self.copy(m["content"])) \
+                        .props("flat dense round size=xs").tooltip("Copy answer (Markdown)")
                 if (m.get("context") or {}).get("truncated"):
                     ui.label("· documents trimmed to fit context")
                 if self.project and m["content"]:
@@ -531,7 +597,10 @@ class Workbench:
                     ui.label("Citations become numbered references with a Sources list.").classes("muted text-xs")
             with ui.expansion("Preview as saved").classes("w-full text-sm").props("dense"):
                 if Path(path).suffix.lower() in (".md", ".docx"):
-                    ui.markdown(self.with_sources(path, content))
+                    saved = self.with_sources(path, content)
+                    body, sep, sources = saved.partition("\n## Sources\n")
+                    # File names like Harborline_Home_Furnishings.pdf would render "_Home_" in italics.
+                    ui.markdown(body + sep + sources.replace("_", "\\_"))
                 else:
                     ui.code(content, language=None).classes("w-full text-xs")
 
@@ -548,11 +617,56 @@ class Workbench:
         self.notify(f"Saved {Path(dest).name}", type="positive")
         self.set_notice(f"✓ Saved to {dest}")
 
+    # ---------- copy / edit sent messages
+
+    def copy(self, text: str):
+        with self.root:
+            ui.clipboard.write(text)
+        self.notify("Copied", position="bottom", timeout=1200)
+
+    def start_edit(self, index: int):
+        if self.pending:
+            return
+        self.editing = index
+        self.main.refresh()
+        self.client.run_javascript("document.querySelector('.edit-box textarea')?.focus()")
+
+    def edit_box(self, m: dict, index: int):
+        later = len(self.chat["messages"]) - index - 1
+        with ui.column().classes("w-full items-end gap-1 edit-box"):
+            box = ui.textarea(value=m["content"]).classes("w-full max-w-[85%]") \
+                .props("outlined autogrow input-style='max-height:300px'")
+            box.on("keydown.enter.exact.prevent", lambda: self.resend(index, box.value))
+            with ui.row().classes("items-center gap-2"):
+                if later:
+                    ui.label(f"Sending replaces the {later} message{'s' if later != 1 else ''} after this one.") \
+                        .classes("muted text-xs")
+                ui.button("Cancel", on_click=self.cancel_edit).props("flat dense no-caps")
+                ui.button("Send", on_click=lambda: self.resend(index, box.value)).props("unelevated dense no-caps")
+
+    def cancel_edit(self):
+        self.editing = None
+        self.main.refresh()
+
+    async def resend(self, index: int, text: str):
+        """Continue the conversation from an earlier message: it and everything after it are replaced
+        (kept in chat["earlier_versions"], not deleted)."""
+        text = (text or "").strip()
+        if not text or self.pending:
+            return
+        chat = chats.get(self.chat["id"])
+        removed = chat["messages"][index:]
+        chat.setdefault("earlier_versions", []).append({"at": time.time(), "messages": removed})
+        chat["messages"] = chat["messages"][:index]
+        chats.save(chat)
+        self.chat, self.editing = chat, None
+        await self.send(text)
+
     # ---------- composer
 
     @ui.refreshable
     def composer(self):
-        with ui.column().classes("w-full max-w-[820px] mx-auto gap-2"):
+        with ui.column().classes("w-full max-w-[1100px] mx-auto gap-2"):
             if self.notice:
                 with ui.row().classes("notice items-start justify-between no-wrap"):
                     ui.label(self.notice).classes("whitespace-pre-wrap")
@@ -600,11 +714,28 @@ class Workbench:
         if self.right in ("files", "context"):
             self.fs_selected = set()
             self.fs_path = self.project["folder"] if self.project else None
-        width = 520 if self.right == "source" else 320
-        self.drawer.props(f"width={width}")
+        self.drawer.props(f"width={self.right_width()}")
         self.drawer.set_value(self.right is not None)
         self.right_panel.refresh()
         self.topbar.refresh()
+
+    def right_width(self) -> int:
+        return self.right_widths["source" if self.right == "source" else "files"]
+
+    def on_resize(self, e):
+        """Drag handle on a drawer border: set its width (clamped so the chat column stays usable)."""
+        side, width = e.args.get("side"), int(e.args.get("width") or 0)
+        if side == "left":
+            self.left_width = max(180, min(520, width))
+            self.left.props(f"width={self.left_width}")
+        elif side == "right":
+            width = max(260, min(1100, width))
+            if e.args.get("initial"):
+                self.right_widths["source"] = width     # remembered width applies to the source panel
+            else:
+                self.right_widths["source" if self.right == "source" else "files"] = width
+            if self.right:
+                self.drawer.props(f"width={self.right_width()}")
 
     @ui.refreshable
     def right_panel(self):
@@ -759,29 +890,24 @@ class Workbench:
                             ui.button("Back to cited page", on_click=lambda: self.source_page(0)) \
                                 .props("flat dense no-caps size=sm color=primary")
 
-            with ui.column().classes("w-full px-4 py-2 gap-1 quote").style(
-                    "border-bottom:1px solid var(--wb-border);max-height:30%;overflow-y:auto;flex:0 0 auto"):
-                b = loc["block"]
-                where = f"page {b['page']}" if is_pdf else f"block {b['id']}"
-                cont = " (continues on next page)" if len({r[0] for r in b["rects"]}) > 1 else ""
-                ui.label(f"{b['heading'] + ' · ' if b['heading'] else ''}{where}{cont}").classes("muted text-xs")
-                ui.html(marked(b["text"], loc["sentence_spans"])).classes("text-[13px] leading-relaxed")
-                if s["claim"] and not loc["sentences"] and b["type"] == "paragraph":
-                    ui.label("No single sentence matched the claim, so the whole paragraph is highlighted.") \
-                        .classes("muted text-xs")
-
+            b = loc["block"]
             if is_pdf:
-                area = ui.scroll_area().classes("grow w-full pdf-scroll")
-                with area:
-                    url = (f"/api/documents/{s['doc_id']}/page/{s['page']}.png?zoom={min(4, 1.5 * s['zoom'])}"
+                with ui.scroll_area().classes("grow w-full pdf-scroll"):
+                    url = (f"/api/documents/{s['doc_id']}/page/{s['page']}.png?zoom={min(4, 2 * s['zoom'])}"
                            f"&block={quote(s['block_id'])}&claim={quote(s['claim'][:800])}")
-                    img = ui.image(url).classes("shadow").style(f"width:{int(100 * s['zoom'])}%;max-width:none")
+                    ui.image(url).classes("shadow").style(f"width:{int(100 * s['zoom'])}%;max-width:none")
                 if s["page"] == b["page"]:
                     ys = [r[2] for r in (loc["sentence_rects"] or b["rects"]) if r[0] == s["page"] - 1]
                     size = loc["page_sizes"].get(str(s["page"] - 1)) or loc["page_sizes"].get(s["page"] - 1)
                     if ys and size:
-                        frac = max(0.0, min(1.0, (min(ys) - 120) / size[1]))
-                        img.on("load", lambda: area.scroll_to(percent=frac))
+                        # Scroll so the highlight sits near the top, once the page image has loaded (done in the
+                        # browser: the image's load event does not reliably reach Python).
+                        frac = max(0.0, min(ys) / size[1])
+                        js = ("(() => { const c = document.querySelector('.rightpanel .pdf-scroll .q-scrollarea__container');"
+                              " const img = c && c.querySelector('img'); if (!img) return;"
+                              f" const go = () => {{ c.scrollTop = Math.max(0, {frac:.4f} * img.offsetHeight - 60); }};"
+                              " if (img.complete && img.naturalHeight) go(); else img.addEventListener('load', go, {once: true}); })()")
+                        ui.timer(0.15, lambda: self.client.run_javascript(js), once=True)
             else:
                 doc = self.doc(s["doc_id"])
                 parts = []
@@ -819,6 +945,7 @@ class Workbench:
         if self.pending:
             return
         self.chat, self.notice, self.project_notice = None, "", ""
+        self.editing = None
         try:
             self.project = projects.get(pid) if pid else None
         except FileNotFoundError as e:
@@ -831,7 +958,7 @@ class Workbench:
     def open_chat(self, cid: str):
         if self.pending:
             return
-        self.chat, self.notice = chats.get(cid), ""
+        self.chat, self.notice, self.editing = chats.get(cid), "", None
         if self.right in ("context", "source"):
             self.toggle_right(None)
         self.refresh_all()
@@ -839,7 +966,7 @@ class Workbench:
     def new_chat(self):
         if self.pending:
             return
-        self.notice = ""
+        self.notice, self.editing = "", None
         self.chat = chats.create(self.project["id"]) if self.project else None
         if self.right == "context":
             self.toggle_right(None)
@@ -908,10 +1035,13 @@ class Workbench:
 
     # ---------- sending
 
-    async def send(self):
-        text = (self.input.value or "").strip()
+    async def send(self, text: str | None = None):
+        from_input = text is None
+        text = ((self.input.value or "") if from_input else text).strip()
         if not text or self.pending:
             return
+        if from_input:
+            self.input.value = ""
         chat = self.ensure_chat()
         p = settings.provider()
         project = projects.get(chat["project_id"]) if chat.get("project_id") else None

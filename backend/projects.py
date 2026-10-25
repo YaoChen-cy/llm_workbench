@@ -15,13 +15,12 @@ import time
 import uuid
 from pathlib import Path
 
-from . import documents
+from . import documents, outputs
 from . import files as fs
 from .settings import DATA_DIR
 
 REGISTRY = DATA_DIR / "projects.json"
 META = ".workbench"
-OUTPUT_SUFFIXES = {".md", ".txt"}
 
 
 def _registry() -> dict:
@@ -204,17 +203,16 @@ def remove_context(pid: str, doc_id: str) -> dict:
 # ---------------------------------------------------------------- outputs
 
 def write_output(pid: str, name: str, content: str, overwrite: bool = False) -> str:
-    """Write a text output inside the project folder (subfolders allowed, .workbench is not)."""
+    """Write an output file inside the project folder (subfolders allowed, .workbench is not).
+    .docx files are converted from Markdown; other supported types are written as text."""
     p = get(pid)
     folder = Path(p["folder"]).resolve()
-    rel = Path(name.strip().lstrip("/\\"))
-    if rel.suffix.lower() not in OUTPUT_SUFFIXES:
-        rel = rel.with_suffix(".md")
+    rel = Path(outputs.clean_path(name))
     dest = (folder / rel).resolve()
     if folder not in dest.parents or META in dest.relative_to(folder).parts:
         raise fs.AccessDenied(f"{name} is outside the project folder.")
     if dest.exists() and not overwrite:
         raise FileExistsError(str(dest.relative_to(folder)))
     dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_text(content, "utf-8")
+    dest.write_bytes(outputs.to_bytes(str(rel), content))
     return str(dest)

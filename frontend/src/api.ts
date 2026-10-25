@@ -192,6 +192,18 @@ export const api = {
   writeFile: (id: string, name: string, content: string, overwrite = false) =>
     req<{ ok: boolean; path: string }>("POST", `/api/projects/${id}/files`, { name, content, overwrite }),
 
+  saveChatFile: (chatId: string, path: string, content: string, overwrite = false) =>
+    req<{ ok: boolean; path: string }>("POST", `/api/chats/${chatId}/files/save`, { path, content, overwrite }),
+  downloadChatFile: async (chatId: string, path: string, content: string) => {
+    const r = await fetch(`/api/chats/${chatId}/files/download`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, content }),
+    });
+    if (!r.ok) throw new Error(`${r.status} ${r.statusText}`);
+    return r.blob();
+  },
+
   chats: (projectId?: string) => req<ChatSummary[]>("GET", `/api/chats${projectId ? `?project_id=${projectId}` : ""}`),
   chat: (id: string) => req<Chat>("GET", `/api/chats/${id}`),
   newChat: (projectId?: string) => req<Chat>("POST", "/api/chats", { project_id: projectId ?? null }),

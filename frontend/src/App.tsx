@@ -14,7 +14,7 @@ import {
 } from "./api";
 import FilePanel from "./FilePanel";
 import { report } from "./fileinfo";
-import Markdown from "./Markdown";
+import Answer from "./Answer";
 import NewProjectModal from "./NewProjectModal";
 import ProjectView from "./ProjectView";
 import SettingsModal from "./SettingsModal";
@@ -436,10 +436,13 @@ export default function App() {
                     <div className="bubble">{m.content}</div>
                   ) : (
                     <div className="answer">
-                      <Markdown
+                      <Answer
                         text={m.content || (m.error ? "" : "_(empty answer)_")}
                         resolve={resolve}
                         onCite={openSource}
+                        chatId={chat?.id}
+                        inProject={!!project}
+                        onNotice={setNotice}
                       />
                       {m.error && <div className="error small">⚠ {m.error}</div>}
                       <div className="meta small muted">
@@ -466,7 +469,7 @@ export default function App() {
                   <div className="msg assistant">
                     <div className="answer">
                       {pending.text ? (
-                        <Markdown text={pending.text} resolve={resolve} onCite={openSource} />
+                        <Answer text={pending.text} resolve={resolve} onCite={openSource} inProject={!!project} onNotice={setNotice} />
                       ) : (
                         <div className="thinking muted">
                           <span className="pulse" /> Reading

@@ -265,3 +265,10 @@ code { background: var(--code); padding: 1px 5px; border-radius: 4px; font-size:
 }
 .pager-sep { width: 1px; height: 16px; background: var(--border); margin: 0 2px; }
 .zoom-label { min-width: 34px; text-align: center; }
+
+/* ---------- files written by the model ---------- */
+.file-card { border: 1px solid var(--border); background: var(--panel); border-radius: 10px; padding: 10px 12px; margin: 8px 0; display: flex; flex-direction: column; gap: 6px; }
+.file-card-head { display: flex; align-items: center; gap: 8px; min-width: 0; font-weight: 550; }
+.file-icon { font-size: 16px; }
+.file-preview { border-top: 1px solid var(--border); padding-top: 8px; max-height: 360px; overflow: auto; font-size: 13px; }
+.file-preview.code { background: var(--code); border-radius: 6px; padding: 8px; font-size: 12px; white-space: pre-wrap; margin: 0; }

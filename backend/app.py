@@ -12,11 +12,11 @@ import uuid
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, UploadFile
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import chats, documents, llm, projects, settings
+from . import chats, documents, llm, outputs, projects, settings
 from . import files as fs
 
 app = FastAPI(title="LLM Workbench")
@@ -308,6 +308,45 @@ def patch_chat(chat_id: str, body: ChatPatch):
             chats.detach(chat, d)
         chats.save(chat)
         return chat
+    except Exception as e:
+        _err(e)
+
+
+class ChatFileReq(BaseModel):
+    path: str
+    content: str
+    overwrite: bool = False
+
+
+def _chat_file(chat_id: str, req: ChatFileReq):
+    """A file block from an answer, with citations turned into numbered sources."""
+    chat = chats.get(chat_id)
+    project = projects.get(chat["project_id"]) if chat.get("project_id") else None
+    entries = (project["context"] if project else []) + chat["docs"]
+    path = outputs.clean_path(req.path)
+    return chat, project, path, outputs.with_sources(path, req.content, entries)
+
+
+@app.post("/api/chats/{chat_id}/files/save")
+def save_chat_file(chat_id: str, req: ChatFileReq):
+    """Save a file the model wrote into the project folder (project chats only)."""
+    try:
+        chat, project, path, content = _chat_file(chat_id, req)
+        if not project:
+            raise ValueError("Only chats inside a project can save to a folder; use Download instead.")
+        return {"ok": True, "path": projects.write_output(project["id"], path, content, req.overwrite)}
+    except Exception as e:
+        _err(e)
+
+
+@app.post("/api/chats/{chat_id}/files/download")
+def download_chat_file(chat_id: str, req: ChatFileReq):
+    try:
+        _, _, path, content = _chat_file(chat_id, req)
+        media = {".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                 ".json": "application/json", ".csv": "text/csv"}.get(Path(path).suffix.lower(), "text/plain")
+        return Response(outputs.to_bytes(path, content), media_type=media,
+                        headers={"Content-Disposition": f'attachment; filename="{Path(path).name}"'})
     except Exception as e:
         _err(e)
 

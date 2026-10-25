@@ -14,7 +14,7 @@ from urllib.parse import quote
 
 from nicegui import events, ui
 
-from . import chats, documents, llm, projects, settings
+from . import chats, documents, llm, outputs, projects, settings
 from . import files as fs
 
 # ---------------------------------------------------------------- styling
@@ -184,6 +184,18 @@ def render_answer(text: str, resolve) -> str:
                            f"{label} · ?</span>")
         return "".join(out)
     return CITE_GROUP.sub(chip, text)
+
+
+def streaming_view(text: str) -> str:
+    """While an answer streams, show file blocks as one-line placeholders instead of raw tags."""
+    out = []
+    for part in outputs.split_answer(text):
+        if part["kind"] == "text":
+            out.append(part["text"])
+        else:
+            state = "ready" if part["complete"] else "writing…"
+            out.append(f"\n\n> 📄 **{part['path']}** — {state} ({len(part['content']):,} characters)\n\n")
+    return "".join(out)
 
 
 def marked(text: str, spans: list) -> str:
@@ -390,9 +402,13 @@ class Workbench:
                 ui.label(m["content"]).classes("bubble")
             return
         with ui.column().classes("answer w-full gap-1"):
-            if m["content"]:
-                ui.markdown(render_answer(m["content"], self.resolve))
-            elif not m.get("error"):
+            for part in outputs.split_answer(m["content"]):
+                if part["kind"] == "text":
+                    if part["text"].strip():
+                        ui.markdown(render_answer(part["text"], self.resolve))
+                else:
+                    self.file_card(part)
+            if not m["content"] and not m.get("error"):
                 ui.label("(empty answer)").classes("muted italic")
             if m.get("error"):
                 ui.label(f"⚠ {m['error']}").classes("err text-xs")
@@ -403,6 +419,78 @@ class Workbench:
                 if self.project and m["content"]:
                     ui.button("Save to folder", on_click=lambda m=m: self.save_to_folder(m)) \
                         .props("flat dense no-caps size=sm color=primary")
+
+    def with_sources(self, path: str, content: str) -> str:
+        """Replace citation IDs with [1], [2]… and append a Sources list, so a saved file stays traceable
+        outside the app. CSV/JSON files are left unchanged."""
+        if Path(path).suffix.lower() not in (".md", ".docx", ".txt"):
+            return content
+        numbers: dict[str, int] = {}
+        sources: list[str] = []
+
+        def ref(m):
+            out = []
+            for cid in re.split(r"\s*[,;]\s*", m.group(1)):
+                entry, doc, block = self.resolve(cid)
+                if not block:
+                    out.append(f"[{cid}?]")
+                    continue
+                key = f"{entry['doc_id']}:{block['id']}"
+                if key not in numbers:
+                    numbers[key] = len(numbers) + 1
+                    where = f"p.{block['page']}" if doc["kind"] == "pdf" else f"block {block['id']}"
+                    quote_ = block["text"][:160] + ("…" if len(block["text"]) > 160 else "")
+                    sources.append(f"{numbers[key]}. {entry['name']}, {where}"
+                                   + (f" ({block['heading']})" if block["heading"] else "") + f": \"{quote_}\"")
+                out.append(f"[{numbers[key]}]")
+            return "".join(out)
+
+        body = CITE_GROUP.sub(ref, content).rstrip()
+        if sources:
+            body += "\n\n## Sources\n\n" + "\n".join(sources) + "\n"
+        return body
+
+    def file_card(self, part: dict):
+        """A file the model wrote in its answer: preview, Save to project folder, Download."""
+        path, content = part["path"], part["content"]
+        with ui.column().classes("card gap-1").style("padding:10px 12px"):
+            with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                ui.icon("description", size="sm").classes("muted")
+                type_badge(path)
+                ui.label(path).classes("font-medium ellipsis1 grow")
+                ui.label(f"{len(content):,} characters" + ("" if part["complete"] else " · incomplete")) \
+                    .classes("muted text-xs")
+            if Path(path).suffix.lower() == ".docx":
+                ui.label("Written in Markdown; saved as a Word document.").classes("muted text-xs")
+            with ui.row().classes("gap-2 items-center"):
+                if self.project:
+                    ui.button("Save to project folder", icon="save",
+                              on_click=lambda: self.save_file(path, self.with_sources(path, content))) \
+                        .props("unelevated dense no-caps size=sm")
+                ui.button("Download", icon="download",
+                          on_click=lambda: ui.download(outputs.to_bytes(path, self.with_sources(path, content)),
+                                                       Path(path).name)) \
+                    .props("outline dense no-caps size=sm")
+                if CITE_GROUP.search(content):
+                    ui.label("Citations become numbered references with a Sources list.").classes("muted text-xs")
+            with ui.expansion("Preview").classes("w-full text-sm").props("dense"):
+                if Path(path).suffix.lower() in (".md", ".docx"):
+                    ui.markdown(content)
+                else:
+                    ui.code(content, language=None).classes("w-full text-xs")
+
+    async def save_file(self, path: str, content: str):
+        try:
+            dest = projects.write_output(self.project["id"], path, content)
+        except FileExistsError:
+            if not await self.confirm(f"{path} already exists in the project folder. Overwrite it?", "Overwrite"):
+                return
+            dest = projects.write_output(self.project["id"], path, content, overwrite=True)
+        except Exception as e:
+            ui.notify(str(e), type="negative")
+            return
+        ui.notify(f"Saved {Path(dest).name}", type="positive")
+        self.set_notice(f"✓ Saved to {dest}")
 
     # ---------- composer
 
@@ -793,7 +881,7 @@ class Workbench:
         def tick():
             if parts:
                 status.set_visibility(False)
-                md.set_content(render_answer("".join(parts), self.resolve))
+                md.set_content(render_answer(streaming_view("".join(parts)), self.resolve))
             else:
                 status.set_text(f"Reading{docs_note} (~{info['prompt_tokens_est']:,} tokens)… {int(time.time() - t0)}s")
             self.client.run_javascript("window.scrollTo(0, document.body.scrollHeight)")

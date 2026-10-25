@@ -30,6 +30,17 @@ python start.py        # Windows 用 py start.py
 - 回答中的引用 `[D1-p2-13]` 显示为 `D1 · p.2` 标签，悬停可看文件名、页码和原文，点击打开来源；模型编造的 ID 显示为红色 `D1 · ?`
 - 文档超出上下文预算时，自动保留和问题最相关的段落，回答下方会注明“documents trimmed”
 
+## 生成文件
+
+模型可以直接生成文件：在对话里说"保存成 Word 文件"、"导出成 CSV"等即可。回答中的文件会显示为卡片，包含文件名、类型、预览，以及两个按钮：
+
+- **Save to project folder**（仅项目内）：保存到项目文件夹（可以有子目录，如 `drafts/summary.docx`），不能写到项目文件夹之外；同名文件会先询问是否覆盖
+- **Download**：通过浏览器下载
+
+支持 `.md`、`.txt`、`.csv`、`.json`、`.docx`。`.docx` 由模型写成 Markdown（标题、列表、粗体、表格），保存时转换成 Word。保存 `.docx` / `.md` / `.txt` 时，引用 ID 会变成 `[1]`、`[2]`…，文末附 **Sources** 列表（文件名、页码、章节和原文摘录），离开本应用也能追溯来源。
+
+实现方式：system prompt 告诉模型用 `<file path="名字.扩展名">…</file>` 包住文件内容（`backend/outputs.py`）。
+
 ## 来源定位（M2）
 
 点击回答中的引用标签（如 `D1 · p.2`），右侧会打开 **Source** 面板：
@@ -68,6 +79,7 @@ backend/
   documents.py   通用解析（PDF/DOCX/TXT/MD）、引用句子定位、带高亮的页面渲染
   chats.py       会话存储、prompt 拼装、超长文档的段落筛选
   projects.py    项目：instructions、context、文件夹沙盒、输出写入
+  outputs.py     模型生成的文件：解析 <file> 块、Markdown 转 Word
 data/            运行时数据（git-ignored）：docs/ 解析缓存，chats/ 会话，uploads/ 上传文件
 cip/             原 CIP 月度总结流程
 ```

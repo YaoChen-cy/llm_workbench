@@ -11,7 +11,7 @@ import time
 import uuid
 from collections import Counter
 
-from . import documents
+from . import documents, outputs
 from .settings import CHATS_DIR
 
 SYSTEM_PROMPT = """You are a careful assistant working with the user's documents.
@@ -20,6 +20,7 @@ When documents are provided:
 - Answer from the documents. Every factual statement taken from them must end with its source ID(s) in square brackets, exactly as written in the documents, e.g. "Revenue was $1.42bn [D1-p1-4]." Multiple sources: [D1-p2-3, D2-p5-1].
 - IDs starting with C are project context (background material); IDs starting with D are documents attached to this chat.
 - Never invent IDs. If the documents do not contain the answer, say so plainly.
+- If no documents are provided, do not write any source IDs at all.
 - Text marked [...] was left out to save space; say if the answer may be in the omitted parts.
 
 Write in clear, concise English and use Markdown for structure."""
@@ -151,6 +152,7 @@ def build_messages(chat: dict, user_text: str, context_tokens: int,
         if project["instructions"].strip():
             system += ("\nFollow the project instructions below for every request in this project."
                        f"\n<project_instructions>\n{project['instructions'].strip()}\n</project_instructions>")
+    system += "\n" + outputs.FILE_INSTRUCTIONS.format(where=outputs.WHERE_PROJECT if project else outputs.WHERE_CHAT)
     if docs:
         system += "\n\n<documents>\n" + "\n\n".join(full) + "\n</documents>"
 

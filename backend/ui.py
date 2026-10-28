@@ -51,6 +51,16 @@ body { background: var(--wb-bg); color: var(--wb-text); font-size: 14px; }
 .wb-resizer:hover, body.wb-resizing .wb-resizer { background: var(--wb-accent); opacity: .35; }
 body.wb-resizing, body.wb-resizing * { cursor: col-resize !important; user-select: none !important; }
 .q-drawer__content { position: relative; }
+.q-dialog__inner--minimized > div { max-width: 95vw; }
+.q-dialog .nicegui-markdown h2, .card .nicegui-markdown h2 { font-size: 16px; font-weight: 650; margin: 10px 0 4px; line-height: 1.3; }
+.q-dialog .nicegui-markdown h3, .card .nicegui-markdown h3 { font-size: 14px; font-weight: 650; margin: 8px 0 2px; line-height: 1.3; }
+.q-dialog .nicegui-markdown ul, .card .nicegui-markdown ul { margin: 2px 0 6px; padding-left: 18px; }   /* Quasar caps dialogs at 560px; our cards set their own width */
+.fit-row { flex-wrap: wrap; }
+.fit-row > .fitchip { flex: 0 0 auto; }
+.fitchip { display: inline-flex; align-items: center; gap: 3px; padding: 1px 7px; border-radius: 10px; border: 1px solid var(--wb-border); }
+.fitchip > div { display: inline; }
+.fit-ok { color: #18794e; } .fit-warn { color: #b54708; border-color: #f5c58b; background: #fff7ed; } .fit-info { color: var(--wb-muted); }
+body.body--dark .fit-ok { color: #7fd8a4; } body.body--dark .fit-warn { color: #ffb35c; border-color: #6b4a1e; background: #2a1f12; }
 .user-msg .msg-actions { opacity: 0; transition: opacity .15s; }
 .user-msg:hover .msg-actions, .user-msg:focus-within .msg-actions { opacity: 1; }
 .answer .file-text { border-left: 3px solid var(--wb-accent-soft); padding-left: 12px; }
@@ -133,14 +143,12 @@ Draft a credit summary for each memo I attach.
 - Bold the key figures. Use $mm for amounts.
 - Only use facts from the attached memo; ask me if something important is missing."""
 
-PROFILE_TEMPLATE = """## Summary profile
-### Structure
-- 
+PROFILE_TEMPLATE = """## Learned rules
 ### Required information
 - 
 ### Content selection
 - 
-### Length
+### Rewriting
 - 
 ### Tone and phrasing
 - 
@@ -348,6 +356,7 @@ class Workbench:
         self.busy = False
         self.docs: dict[str, dict] = {}
         self.editing: int | None = None         # index of the user message being edited
+        self.fit_cache: dict = {}               # (chat, message, profile version) -> profile checks
         self.left_width = 260                   # drawer widths in px, changed by dragging their borders
         self.right_widths = {"source": 560, "files": 320}
 
@@ -545,6 +554,8 @@ class Workbench:
             for part in parts:
                 if part["kind"] == "file":
                     self.file_card(part)
+            if self.project and m["content"] and not m.get("error"):
+                self.fit_row(m)
             if not m["content"] and not m.get("error"):
                 ui.label("(empty answer)").classes("muted italic")
             if m.get("error"):
@@ -565,6 +576,30 @@ class Workbench:
                             .tooltip("Keep this answer (and the chat's documents) as an example the profile is learned from")
                         ui.item("Use as summary profile…", on_click=lambda m=m: self.use_as_profile(m)) \
                             .tooltip("Use this answer, e.g. a summary structure you agreed on, as the project's profile")
+
+    def fit_row(self, m: dict):
+        """How a drafted summary compares with the project's profile targets (measured in code, no LLM)."""
+        prof = knowledge.get_profile(self.project)
+        if not prof or not prof.get("targets"):
+            return
+        key = (self.chat["id"] if self.chat else "", m.get("created"), prof["version"])
+        if key not in self.fit_cache:
+            docs = [(e["label"], d) for e in self.entries() if (d := self.doc(e["doc_id"]))]
+            try:
+                self.fit_cache[key] = knowledge.check_draft(self.project, answer_summary_text(m["content"]), docs)
+            except Exception:
+                self.fit_cache[key] = []
+        checks = self.fit_cache[key]
+        if not checks:
+            return
+        with ui.row().classes("items-center gap-1 text-xs fit-row"):
+            ui.label(f"Profile v{prof['version']} check:").classes("muted")
+            for c in checks:
+                icon, cls = ("check_circle", "fit-ok") if c["ok"] else ("info", "fit-info") if c["ok"] is None \
+                    else ("warning", "fit-warn")
+                with ui.element("span").classes(f"fitchip {cls}"):
+                    ui.icon(icon, size="14px")
+                    ui.label(f"{c['label']}: {c['text']}")
 
     def with_sources(self, path: str, content: str) -> str:
         """Replace citation IDs with [1], [2]… and append a Sources list, so a saved file stays traceable
@@ -877,16 +912,18 @@ class Workbench:
 
     def open_source(self, cid: str, claim: str):
         entry, doc, block = self.resolve(cid)
-        if not block:
-            return
+        if block:
+            self.open_block(entry["doc_id"], block["id"], claim, cid)
+
+    def open_block(self, doc_id: str, block_id: str, claim: str, label: str):
         try:
-            loc = documents.locate(entry["doc_id"], block["id"], claim)
+            loc = documents.locate(doc_id, block_id, claim)
         except Exception as e:                 # never fail silently: say why the source can't be shown
-            self.notify(f"Can't open the source of {cid}: {e}", type="negative", multi_line=True,
+            self.notify(f"Can't open the source of {label}: {e}", type="negative", multi_line=True,
                         timeout=0, close_button=True)
             return
-        self.source = {"doc_id": entry["doc_id"], "label": cid, "block_id": block["id"], "claim": claim,
-                       "loc": loc, "page": block["page"], "zoom": 1.0}
+        self.source = {"doc_id": doc_id, "label": label, "block_id": block_id, "claim": claim,
+                       "loc": loc, "page": loc["block"]["page"], "zoom": 1.0}
         self.right = None
         self.toggle_right("source")
 
@@ -1317,6 +1354,9 @@ class Workbench:
                     ui.label(("← " + ", ".join(ex["sources"])) if ex["sources"] else "(no source document)") \
                         .classes("muted text-xs ellipsis1 grow")
                     ui.badge("from chat" if ex["origin"] == "chat" else "uploaded").props("outline")
+                    ui.button(icon="insights", on_click=lambda ex=ex: self.view_analysis(ex)) \
+                        .props("flat dense round size=xs").tooltip("Analysis: where each sentence comes from, "
+                                                                  "coverage, rewriting, length").set_enabled(bool(ex["sources"]))
                     ui.button(icon="visibility", on_click=lambda ex=ex: self.view_example(ex)) \
                         .props("flat dense round size=xs").tooltip("View the expected summary")
                     ui.button(icon="close", on_click=lambda ex=ex: self.remove_example(ex)) \
@@ -1333,10 +1373,22 @@ class Workbench:
                     ui.label(f"Summary profile v{prof['version']} · confirmed "
                              f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(prof['updated']))} · used in every chat "
                              "in this project").classes("text-sm grow")
-                    ui.button("View / edit", on_click=lambda: self.profile_editor(prof["text"], prof.get("stats"), "",
-                                                                                 "edited")).props("outline dense no-caps size=sm")
+                    ui.button("View / edit", on_click=lambda: self.profile_editor(prof["learned"], prof["pinned"], None,
+                                                                                 "", "edited")).props("outline dense no-caps size=sm")
                     ui.button(icon="delete", on_click=self.remove_profile).props("flat dense round size=sm") \
                         .tooltip("Stop using the profile")
+                t = prof.get("targets") or {}
+                facts = []
+                if t.get("words"):
+                    facts.append(f"target {t['words'][0]}–{t['words'][1]} words")
+                if t.get("verbatim"):
+                    facts.append(f"{t['verbatim'][0]}–{t['verbatim'][1]}% verbatim")
+                if prof.get("pinned"):
+                    facts.append(f"{sum(1 for ln in prof['pinned'].splitlines() if ln.strip())} pinned rule(s)")
+                if prof.get("changes"):
+                    facts.append(f"last change: {prof['changes']}")
+                if facts:
+                    ui.label(" · ".join(facts)).classes("muted text-xs")
                 with ui.expansion("Show profile").classes("w-full text-sm").props("dense"):
                     ui.markdown(prof["text"])
             else:
@@ -1344,7 +1396,7 @@ class Workbench:
                     ui.icon("radio_button_unchecked", size="sm").classes("muted")
                     ui.label("No summary profile yet. Learn one from the examples, or write it yourself.") \
                         .classes("muted text-sm grow")
-                    ui.button("Write manually", on_click=lambda: self.profile_editor(PROFILE_TEMPLATE, None, "", "manual")) \
+                    ui.button("Write manually", on_click=lambda: self.profile_editor(PROFILE_TEMPLATE, "", None, "", "manual")) \
                         .props("flat dense no-caps size=sm color=primary")
 
     async def view_example(self, ex: dict):
@@ -1355,6 +1407,70 @@ class Workbench:
             ui.label("Sources: " + (", ".join(ex["sources"]) or "none")).classes("muted text-xs")
             with ui.scroll_area().classes("w-full h-[60vh]"):
                 ui.markdown(ex["summary"])
+        dialog.on("hide", dialog.delete)
+        dialog.open()
+
+    async def view_analysis(self, ex: dict):
+        """What the app measured for one example: each summary sentence with its source, coverage, length."""
+        pid = self.project["id"]
+        try:
+            ev = await asyncio.to_thread(knowledge.evidence, pid, ex)
+        except Exception as e:
+            self.notify(f"Could not analyse {ex['name']}: {e}", type="negative", multi_line=True)
+            return
+        with self.root, ui.dialog() as dialog, ui.card().classes("w-[960px] max-w-full gap-2"):
+            with ui.row().classes("w-full items-center justify-between"):
+                ui.label(f"Analysis · {ex['name']}").classes("font-semibold text-base")
+                ui.button(icon="close", on_click=dialog.close).props("flat dense round size=sm")
+            facts = [f"{ev['words']} words", f"{ev['points']} points in {len(ev['sections'])} section(s)",
+                     f"{round(ev['compression'] * 100)}% of the source length",
+                     f"{round(ev['verbatim'] * 100)}% verbatim",
+                     f"figures in source: {ev['numbers'] - ev['numbers_missing']}/{ev['numbers']}",
+                     f"{ev['bold']['count']} bold phrases"]
+            with ui.row().classes("gap-2"):
+                for f in facts:
+                    ui.badge(f).props("outline")
+            with ui.scroll_area().classes("w-full h-[62vh]"):
+                ui.label("Where each summary sentence comes from (click a source to see it highlighted)") \
+                    .classes("text-sm font-medium")
+                with ui.element("table").classes("w-full text-sm").style("border-collapse:collapse"):
+                    with ui.element("tr").classes("muted text-xs"):
+                        for h in ("Summary section", "Summary sentence", "Source", "Verbatim", "Figures"):
+                            with ui.element("th").style("text-align:left;padding:4px 6px;border-bottom:1px solid var(--wb-border)"):
+                                ui.label(h)
+                    td = "padding:6px;border-bottom:1px solid var(--wb-border);vertical-align:top"
+                    for r in ev["sentences"]:
+                        with ui.element("tr"):
+                            with ui.element("td").style(td + ";width:15%"):
+                                ui.label(r["section"] or "—").classes("muted")
+                            with ui.element("td").style(td):
+                                ui.label(r["text"].replace("**", ""))
+                            with ui.element("td").style(td + ";width:24%"):
+                                where = f"{r['source_section']} · p.{r['page']}" if r["kind"] == "pdf" else r["source_section"]
+                                ui.button(where, on_click=lambda r=r: (dialog.close(), self.open_block(
+                                    r["doc_id"], r["block_id"], r["text"], f"{ex['name']} · {r['block_id']}"))) \
+                                    .props("flat dense no-caps size=sm color=primary align=left").classes("text-left")
+                                for o in r.get("also", []):
+                                    ui.label(f"+ {o['source_section']}").classes("muted text-xs")
+                            with ui.element("td").style(td + ";width:8%"):
+                                ui.label(f"{round(r['verbatim'] * 100)}%")
+                            with ui.element("td").style(td + ";width:13%"):
+                                if r["numbers_missing"]:
+                                    ui.label("not in source: " + ", ".join(r["numbers_missing"])).classes("err text-xs")
+                                elif r["numbers"]:
+                                    ui.label(f"✓ {r['numbers']}").classes("text-xs")
+                if ev["unmatched"]:
+                    ui.label("Sentences with no clear source (the writer's own additions)").classes("text-sm font-medium mt-3")
+                    for u in ev["unmatched"]:
+                        ui.label(f"• [{u['section'] or '—'}] {u['text'].replace('**', '')}").classes("text-sm")
+                ui.label("Source sections").classes("text-sm font-medium mt-3")
+                with ui.row().classes("gap-2"):
+                    for name, c in ev["coverage"].items():
+                        if c["words"] < 15:
+                            continue
+                        used = c["used"] > 0
+                        ui.badge(f"{name}: {c['used']}/{c['total']}").props(f"{'' if used else 'outline'} "
+                                                                          f"color={'positive' if used else 'grey'}")
         dialog.on("hide", dialog.delete)
         dialog.open()
 
@@ -1459,8 +1575,8 @@ class Workbench:
             await self.learn_flow()
 
     async def use_as_profile(self, m: dict):
-        text = answer_summary_text(m["content"])
-        await self.profile_editor(text, None, "", "chat")
+        prof = knowledge.get_profile(self.project) or {}
+        await self.profile_editor(answer_summary_text(m["content"]), prof.get("pinned", ""), None, "", "chat")
 
     async def learn_flow(self):
         pid = self.project["id"]
@@ -1469,8 +1585,8 @@ class Workbench:
             with ui.row().classes("items-center gap-3 no-wrap"):
                 ui.spinner(size="md")
                 msg = ui.label("Starting…").classes("text-sm")
-            ui.label("One LLM call per example plus one to combine them; this can take a few minutes.") \
-                .classes("muted text-xs")
+            ui.label("New examples are measured and analysed (one LLM call each; earlier ones are reused), then "
+                     "combined with one more call.").classes("muted text-xs")
         dlg.open()
         try:
             draft = await knowledge.learn(pid, settings.provider(), progress=msg.set_text)
@@ -1481,23 +1597,38 @@ class Workbench:
             return
         dlg.close()
         dlg.delete()
-        await self.profile_editor(draft["profile"], draft["stats"], draft["suggestions"], "learned")
+        prof = knowledge.get_profile(self.project) or {}
+        await self.profile_editor(draft["learned"], prof.get("pinned", ""), draft, draft["suggestions"], "learned")
 
-    async def profile_editor(self, text: str, stats: dict | None, suggestions: str, source: str):
+    async def profile_editor(self, learned: str, pinned: str, draft: dict | None, suggestions: str, source: str):
+        """Review a profile: measured part (read-only, from code), learned rules (editable) and pinned rules
+        (the user's own; kept when re-learning)."""
         pid = self.project["id"]
+        current = knowledge.get_profile(self.project) or {}
+        measured = (draft or current).get("measured_md", "")
         titles = {"learned": "Review the learned summary profile", "edited": "Edit the summary profile",
                   "chat": "Use this answer as the summary profile", "manual": "Write the summary profile"}
-        with self.root, ui.dialog().props("persistent") as dialog, ui.card().classes("w-[760px] max-w-full gap-2"):
+        with self.root, ui.dialog().props("persistent") as dialog, ui.card().classes("w-[820px] max-w-full gap-2"):
             ui.label(titles.get(source, "Summary profile")).classes("font-semibold text-base")
-            ui.label("Edit anything that is wrong, then confirm. The confirmed profile is added to every chat in this "
-                     "project: summaries follow its structure, length and tone, and the assistant asks you when "
-                     "'Required information' is missing.").classes("muted text-xs")
-            if stats:
-                ui.label("Measured from the examples: " + knowledge.stats_text(stats).replace("\n- ", " · ").lstrip("- ")) \
-                    .classes("muted text-xs")
-            editor = ui.textarea(value=text).classes("w-full").props(
-                "outlined autogrow input-style='min-height:320px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px'")
-            append = None
+            note = ("The confirmed profile goes into every chat in this project; drafts are also checked against its "
+                    "measured targets.")
+            if draft:
+                note += (f" {draft['examples']} example(s); {draft['newly_analyzed']} newly analysed, the rest reused "
+                         "from earlier.")
+            ui.label(note).classes("muted text-xs")
+            if measured:
+                with ui.expansion("Measured by the app (from the examples; read-only)", value=True) \
+                        .classes("w-full text-sm").props("dense"):
+                    ui.markdown(measured)
+            ui.label("Learned rules — edit anything that is wrong; (k/N) shows how many examples support a rule") \
+                .classes("text-sm font-medium")
+            editor = ui.textarea(value=learned).classes("w-full").props(
+                "outlined autogrow input-style='min-height:240px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px'")
+            ui.label("Pinned rules — your own rules; always applied, override the rest, and kept when re-learning") \
+                .classes("text-sm font-medium")
+            pin = ui.textarea(value=pinned, placeholder="- e.g. Always state the provision as from/to and % of exposure") \
+                .classes("w-full").props("outlined autogrow input-style='min-height:70px'")
+            append = sugg = None
             if suggestions.strip():
                 ui.label("Suggested additions to the project instructions").classes("text-sm font-medium")
                 sugg = ui.textarea(value=suggestions).classes("w-full").props("outlined autogrow")
@@ -1507,15 +1638,16 @@ class Workbench:
                 ui.button("Confirm & save", on_click=lambda: dialog.submit(True)).props("unelevated no-caps")
         ok = await dialog
         dialog.delete()
-        if not ok or not (editor.value or "").strip():
+        if not ok or not ((editor.value or "").strip() or (pin.value or "").strip()):
             return
-        prof = knowledge.save_profile(pid, editor.value, stats, source)
+        prof = knowledge.save_profile(pid, editor.value or "", pin.value or "", draft, source)
         if append is not None and append.value and (sugg.value or "").strip():
             instr = (self.project["instructions"].rstrip() + "\n\n" + sugg.value.strip()).strip()
             projects.update(pid, instructions=instr)
         self.reload_project()
         self.main.refresh()
-        self.notify(f"Summary profile v{prof['version']} saved; new messages in this project use it.", type="positive")
+        self.notify(f"Summary profile v{prof['version']} saved ({prof['changes']}); new messages in this project use it.",
+                    type="positive", multi_line=True)
 
     # ---------- new project dialog
 

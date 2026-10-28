@@ -36,17 +36,21 @@ python start.py        # Windows 用 py start.py
 
 项目页的 **Knowledge base** 卡片：
 
-1. **Add example…**：上传源文档（PDF/Word/TXT/MD，可多个）和对应的**期望 summary**（Word/PDF/TXT/MD，或直接粘贴）。Word summary 的标题、项目符号和粗体会保留，导入后可以检查和修改文字。
-2. **Learn from examples**：每个样本调用一次 LLM，对比源文档和 summary（结构、取哪些信息、长度、语气、必需信息），再调用一次合并成 **Summary profile**，并给出可以加进 instructions 的建议。字数、要点数、粗体数由代码统计，不靠模型估计。
-3. **审阅并确认**：profile 可以直接修改；勾选后，建议会追加到项目 instructions。确认后保存为新版本（旧版本保留在 `profile.json` 的 history 里）。
+1. **Add example…**：上传源文档（PDF/Word/TXT/MD，可多个）和对应的**期望 summary**（Word/PDF/TXT/MD，或直接粘贴）。Word 的标题、项目符号和粗体会保留。
+2. **Analysis**（样本行上的 📈 图标）：app 用代码把 summary 的每一句对齐到原文出处（章节、页码，点击可在 PDF 中高亮），并测量原文完整度（哪些章节被用/跳过）、长度与压缩比、原句比例（rephrase）、数字是否出自原文、粗体。
+3. **Learn from examples**，分三步：
+   - **测量（代码）**：上面的对齐与指标，每个样本算一次并缓存；
+   - **分析（LLM）**：模型看的是已对齐的"原文段落 → summary 句子"，总结取舍理由、改写方式、语气；每个样本分析一次并缓存，以后新增样本只分析新的；
+   - **合并**：代码汇总测量结果（带支持度，如 3/4 个样本），模型写定性规则，每条规则标注 (k/N)。
+4. **审阅并确认**：profile 分三部分——**Measured**（代码测量，只读）、**Learned rules**（可改）、**Pinned rules**（你自己的规则，始终生效、优先级最高，重新学习时不会被覆盖）。每次确认生成新版本，并记录改了什么。
 
-确认后的 profile 和最近一个样本 summary（只作格式参考）会加进这个项目**每个对话**的 system prompt：summary 按 profile 的结构、长度、语气写；profile 中 "Required information" 在文档里找不到时，模型会先问你。
+对话中，确认后的 profile + 2–4 组"原文 → summary"改写示例会加进这个项目每个对话的 system prompt（样本里的引用、[1] 编号和 Sources 列表会先去掉，不影响引用格式）。起草的 summary 下方会显示 **Profile check**：长度、章节、数字是否出自原文、原句比例、是否用到"总是采用"的原文章节——全部由代码测量，不额外调用模型。
 
 在项目对话里，回答下方的 **Add to knowledge base** 菜单：
-- **Save as example summary**：把这个回答保存为样本，对话里 attach 的文件和回答引用到的项目 context 文档一起作为它的源文档；保存后可以直接重新学习
-- **Use as summary profile…**：把这个回答（比如你和模型讨论确定的 summary 结构）编辑后直接作为 profile
+- **Save as example summary**：把这个回答保存为样本（对话里的文件和回答引用的项目 context 文档作为源文档），可以直接重新学习
+- **Use as summary profile…**：把这个回答编辑后作为 Learned rules
 
-数据保存在 `<项目文件夹>/.workbench/knowledge/`（`examples/` 和 `profile.json`），随项目文件夹一起复制。
+数据保存在 `<项目文件夹>/.workbench/knowledge/`（`examples/<id>/` 含源文件、`summary.md`、`evidence.json`、`notes.json`；`profile.json` 含各版本），随项目文件夹一起复制。
 
 ## 生成文件
 
@@ -98,7 +102,9 @@ backend/
   chats.py       会话存储、prompt 拼装、超长文档的段落筛选
   projects.py    项目：instructions、context、文件夹沙盒、输出写入
   outputs.py     模型生成的文件：解析 <file> 块、Markdown 转 Word
-  knowledge.py   知识库：样本、从样本学习 summary profile、加进 prompt
+  knowledge.py   知识库：样本、学习 profile（测量 + 分析 + 合并）、pinned 规则、draft 检查
+  alignment.py   summary ↔ 原文对齐与测量（出处、覆盖、长度、原句比例、数字）
+  citations.py   宽松的引用识别（各种写法都能点击）
 data/            运行时数据（git-ignored）：docs/ 解析缓存，chats/ 会话，uploads/ 上传文件
 cip/             原 CIP 月度总结流程
 ```

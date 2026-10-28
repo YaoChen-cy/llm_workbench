@@ -25,6 +25,10 @@ When documents are provided:
 
 Write in clear, concise English and use Markdown for structure."""
 
+CITATION_REMINDER = ("Citation format (this overrides any example, profile or template): end every fact taken from "
+                     "the documents above with its source ID(s) in square brackets, copied exactly, e.g. [C1-p2-13] or "
+                     "[D1-p1-4, D1-p2-3]. Do not use numbered references like [1], footnotes, or a Sources list.")
+
 DOC_SHARE = 0.6          # fraction of the context budget available for documents
 REPLY_RESERVE = 1500     # tokens kept free for the answer
 
@@ -157,6 +161,8 @@ def build_messages(chat: dict, user_text: str, context_tokens: int,
     system += "\n" + outputs.FILE_INSTRUCTIONS.format(where=outputs.WHERE_PROJECT if project else outputs.WHERE_CHAT)
     if docs:
         system += "\n\n<documents>\n" + "\n\n".join(full) + "\n</documents>"
+        # Repeated last, next to the documents: profiles and examples must not change the citation format.
+        system += "\n\n" + CITATION_REMINDER
 
     # Keep as much recent history as fits.
     remaining = context_tokens - est_tokens(system) - est_tokens(user_text) - REPLY_RESERVE

@@ -14,7 +14,7 @@ from urllib.parse import quote
 
 from nicegui import events, ui
 
-from . import chats, documents, knowledge, llm, outputs, projects, settings
+from . import chats, citations, documents, knowledge, llm, outputs, projects, settings
 from . import files as fs
 
 # ---------------------------------------------------------------- styling
@@ -208,13 +208,28 @@ def slug(s: str) -> str:
 
 # ---------------------------------------------------------------- citations in answers
 
-_ID = r"[CD]\d+-[a-z]?\d+(?:-t?\d+)?"
-CITE_GROUP = re.compile(rf"\[({_ID}(?:\s*[,;]\s*{_ID})*)\]", re.I)
+def _citation_groups(text: str, resolve):
+    """Citation groups in `text` with each citation resolved: (start, end, [(cid, entry, doc, block), ...]).
+    Groups whose citations have no document label and match no attached document are skipped (plain text)."""
+    for s, e, parts in citations.find(text):
+        resolved = []
+        for label, block_id in parts:
+            entry, doc, block = resolve(f"{label or '*'}-{block_id}")
+            cid = f"{entry['label']}-{block_id}" if entry else f"{label or '?'}-{block_id}"
+            resolved.append((cid, entry, doc, block, label))
+        if all(r[4] is None and r[3] is None for r in resolved):
+            continue
+        yield s, e, [r[:4] for r in resolved]
 
 
 def claim_before(prefix: str) -> str:
     """The sentence a citation backs: text since the previous sentence end / citation / line break."""
-    line = CITE_GROUP.sub("\0", prefix[prefix.rfind("\n") + 1:])
+    line = prefix[prefix.rfind("\n") + 1:]
+    pieces, at = [], 0
+    for s, e, _ in citations.find(line):
+        pieces += [line[at:s], "\0"]
+        at = e
+    line = "".join(pieces) + line[at:]
     parts = [s.strip() for s in re.split(r"\0|(?<=[.!?])\s+(?=[A-Z*\"(])", line)]
     claim = ""
     for s in reversed(parts):
@@ -226,12 +241,13 @@ def claim_before(prefix: str) -> str:
 
 
 def render_answer(text: str, resolve) -> str:
-    """Markdown with [D1-p2-3] citations replaced by clickable chips (HTML spans)."""
-    def chip(m):
-        claim = claim_before(text[:m.start()])
-        out = []
-        for cid in re.split(r"\s*[,;]\s*", m.group(1)):
-            entry, doc, block = resolve(cid)
+    """Markdown with citations ([C1-p2-13] and common variants) replaced by clickable chips (HTML spans)."""
+    out, at = [], 0
+    for start, end, items in _citation_groups(text, resolve):
+        out.append(text[at:start])
+        at = end
+        claim = claim_before(text[:start])
+        for cid, entry, doc, block in items:
             label = cid.split("-")[0].upper()
             if block:
                 loc = f"p.{block['page']}" if doc["kind"] == "pdf" else f"¶{block['id'][1:]}"
@@ -245,8 +261,8 @@ def render_answer(text: str, resolve) -> str:
             else:
                 out.append(f'<span class="cite bad" title="Source {html.escape(cid)} not found in the attached documents">'
                            f"{label} · ?</span>")
-        return "".join(out)
-    return CITE_GROUP.sub(chip, text)
+    out.append(text[at:])
+    return "".join(out)
 
 
 TEXT_FILES = (".md", ".docx", ".txt")
@@ -359,8 +375,14 @@ class Workbench:
         return (self.chat["docs"] if self.chat else []) + (self.project["context"] if self.project else [])
 
     def resolve(self, cid: str):
+        """cid like "C1-p2-13"; label "*" means "whichever attached document has this block" (unique only)."""
         label, _, bid = cid.partition("-")
-        entry = next((d for d in self.entries() if d["label"].lower() == label.lower()), None)
+        if label == "*":
+            hits = [d for d in self.entries()
+                    if (doc := self.doc(d["doc_id"])) and any(b.get("id") == bid for b in doc["blocks"])]
+            entry = hits[0] if len(hits) == 1 else None
+        else:
+            entry = next((d for d in self.entries() if d["label"].lower() == label.lower()), None)
         doc = self.doc(entry["doc_id"]) if entry else None
         block = next((b for b in doc["blocks"] if b.get("id") == bid), None) if doc else None
         return entry, doc, block
@@ -552,10 +574,9 @@ class Workbench:
         numbers: dict[str, int] = {}
         sources: list[str] = []
 
-        def ref(m):
+        def ref(items):
             out = []
-            for cid in re.split(r"\s*[,;]\s*", m.group(1)):
-                entry, doc, block = self.resolve(cid)
+            for cid, entry, doc, block in items:
                 if not block:
                     out.append(f"[{cid}?]")
                     continue
@@ -569,7 +590,11 @@ class Workbench:
                 out.append(f"[{numbers[key]}]")
             return "".join(out)
 
-        body = CITE_GROUP.sub(ref, content).rstrip()
+        pieces, at = [], 0
+        for start, end, items in _citation_groups(content, self.resolve):
+            pieces += [content[at:start], ref(items)]
+            at = end
+        body = ("".join(pieces) + content[at:]).rstrip()
         if sources:
             body += "\n\n## Sources\n\n" + "\n".join(sources) + "\n"
         return body
@@ -595,7 +620,7 @@ class Workbench:
                           on_click=lambda: self.download(outputs.to_bytes(path, self.with_sources(path, content)),
                                                        Path(path).name)) \
                     .props("outline dense no-caps size=sm")
-                if CITE_GROUP.search(content):
+                if citations.has_citations(content):
                     ui.label("Citations become numbered references with a Sources list.").classes("muted text-xs")
             with ui.expansion("Preview as saved").classes("w-full text-sm").props("dense"):
                 if Path(path).suffix.lower() in (".md", ".docx"):

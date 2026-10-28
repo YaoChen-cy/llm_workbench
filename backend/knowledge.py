@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pymupdf
 
-from . import documents, llm, projects
+from . import citations, documents, llm, projects
 from . import files as fs
 
 SUMMARY_TYPES = {".md", ".txt", ".docx", ".pdf"}
@@ -57,7 +57,7 @@ Measured from the example summaries (these numbers are exact; use them for lengt
 {analyses}
 </analyses>
 
-Write ONE summary profile that another writer could follow to produce indistinguishable summaries for new documents. Only state patterns supported by the examples; be concrete, and quote a short example phrase for each style rule. Output exactly this Markdown and nothing else:
+Write ONE summary profile that another writer could follow to produce indistinguishable summaries for new documents. Only state patterns supported by the examples; be concrete, and quote a short example phrase for each style rule. Do not include any rule about citations, reference numbers, footnotes or source lists: the app adds source citations itself. Output exactly this Markdown and nothing else:
 
 ## Summary profile
 ### Structure
@@ -272,12 +272,13 @@ async def learn(pid: str, provider: dict, progress=lambda msg: None) -> dict:
     analyses = []
     for i, ex in enumerate(examples, 1):
         progress(f"Analyzing example {i} of {len(examples)}: {ex['name']}…")
-        source = _source_text(kdir / ex["id"], ex["sources"], budget - len(ex["summary"]))
-        prompt = ANALYZE_PROMPT.format(source=source, summary=ex["summary"])
+        summary = citations.strip(ex["summary"])
+        source = _source_text(kdir / ex["id"], ex["sources"], budget - len(summary))
+        prompt = ANALYZE_PROMPT.format(source=source, summary=summary)
         analyses.append(f"### Example {i}: {ex['name']}\n" +
                         await llm.complete([{"role": "user", "content": prompt}], provider))
     progress("Combining the analyses into a summary profile…")
-    st = stats([ex["summary"] for ex in examples])
+    st = stats([citations.strip(ex["summary"]) for ex in examples])
     prompt = MERGE_PROMPT.format(n=len(examples), instructions=project["instructions"].strip() or "(none)",
                                  stats=stats_text(st), analyses="\n\n".join(analyses))
     out = await llm.complete([{"role": "user", "content": prompt}], provider)
@@ -311,9 +312,10 @@ def prompt_section(project: dict, max_example_chars: int = 2500) -> str:
     except FileNotFoundError:
         examples = []
     if examples:
-        ex = examples[-1]["summary"].strip()
+        ex = citations.strip(examples[-1]["summary"])
         if len(ex) > max_example_chars:
             ex = ex[:max_example_chars] + "\n[...]"
-        out += ("\nAn approved summary from this project, as a format reference only (do not reuse its facts):"
+        out += ("\nAn approved summary from this project, as a format reference only (do not reuse its facts; its "
+                "source citations were removed, so still cite every fact as instructed):"
                 f"\n<example_summary>\n{ex}\n</example_summary>")
     return out

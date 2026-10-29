@@ -12,10 +12,13 @@ Safety rules (the LLM is not involved; the user types the URL and ticks the file
 - only document types (PDF, Word, Excel, PowerPoint, CSV, text); the file's first bytes must match its type,
   so a login page saved as "report.pdf" is refused
 - files are written only into the chosen folder (no size or count limits)
-Uses the system proxy settings (company proxy) unless Settings → Web says otherwise.
+Uses the system proxy settings (company proxy) unless Settings → Web says otherwise, and the system's trusted
+certificates (Windows certificate store / macOS Keychain), so internal sites signed by the company's own root
+certificate open as they do in the browser. Certificates are always verified.
 """
 import asyncio
 import re
+import ssl
 from pathlib import Path
 from urllib.parse import unquote, urldefrag, urljoin, urlsplit
 
@@ -57,6 +60,22 @@ class FetchError(Exception):
     pass
 
 
+class SignInNeeded(FetchError):
+    """The page asks for a sign-in: the From web steps then open it in the browser (browserfetch)."""
+
+
+# Sign-in services a company site may send the browser to
+LOGIN_HOSTS = ("login.microsoftonline.com", "login.microsoft.com", "login.windows.net", "login.live.com",
+               "id.atlassian.com", "okta.com", "oktapreview.com", "onelogin.com", "pingone.com", "duosecurity.com",
+               "accounts.google.com")
+
+
+def is_login_host(host: str) -> bool:
+    host = host.lower().rstrip(".")
+    return any(host == d or host.endswith("." + d) for d in LOGIN_HOSTS) or \
+        bool(re.match(r"^(adfs|sts|sso|login|auth|signin)\d*[.-]", host))
+
+
 # ---------------------------------------------------------------- rules
 
 def options() -> dict:
@@ -89,8 +108,27 @@ def check_url(url: str, opts: dict | None = None) -> str:
     return url
 
 
+def _ssl_context() -> ssl.SSLContext | bool:
+    """The operating system's certificate store (what the browser trusts), else Python's own list (certifi)."""
+    try:
+        import truststore
+    except ImportError:
+        return True
+    return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+
+def network_error(e: Exception, prefix: str) -> str:
+    """A readable message for a failed connection."""
+    text = str(e)
+    if "certificate" in text.lower() or "CERTIFICATE_VERIFY_FAILED" in text:
+        return ("The site's security certificate is not trusted by this computer, so it was not opened. If the page "
+                f"opens in your browser without a warning, ask IT to install the company's root certificate. ({text})")
+    return f"{prefix}: {e.__class__.__name__} {text}".strip()
+
+
 def _client(opts: dict) -> httpx.AsyncClient:
     return httpx.AsyncClient(follow_redirects=False, timeout=TIMEOUT, trust_env=bool(opts.get("use_system_proxy", True)),
+                             verify=_ssl_context(),
                              headers={"User-Agent": USER_AGENT})
 
 
@@ -103,11 +141,12 @@ async def _open(client: httpx.AsyncClient, url: str, opts: dict, method: str = "
         if r.status_code in (301, 302, 303, 307, 308) and "location" in r.headers:
             await r.aclose()
             url = urljoin(url, r.headers["location"])
+            if is_login_host(urlsplit(url).hostname or ""):
+                raise SignInNeeded("The site sends you to a sign-in page.")
             continue
         if r.status_code in (401, 403):
             await r.aclose()
-            raise FetchError(f"The site refused access (HTTP {r.status_code}); it may need a sign-in. "
-                             "Download it in your browser and upload it instead.")
+            raise SignInNeeded(f"The site refused access (HTTP {r.status_code}); it needs a sign-in.")
         if r.status_code >= 400:
             await r.aclose()
             raise FetchError(f"The site answered HTTP {r.status_code}.")
@@ -168,6 +207,8 @@ async def scan(url: str) -> dict:
                                              base_url=final)
     except (ValueError, LookupError):
         page = lxml.html.document_fromstring(bytes(body) or b"<html></html>", base_url=final)
+    if page.xpath("//input[@type='password']"):
+        raise SignInNeeded("The page is a sign-in form.")
     page.make_links_absolute(final, resolve_base_href=True)
     title = (page.findtext(".//title") or "").strip() or host
     items, seen = [], set()

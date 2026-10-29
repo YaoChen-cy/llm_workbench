@@ -13,9 +13,9 @@ from pathlib import Path
 from urllib.parse import quote
 
 import httpx
-from nicegui import events, ui
+from nicegui import background_tasks, events, ui
 
-from . import chats, citations, documents, knowledge, llm, outputs, projects, settings, webfetch
+from . import browserfetch, chats, citations, documents, knowledge, llm, outputs, projects, settings, webfetch
 from . import files as fs
 
 # ---------------------------------------------------------------- styling
@@ -297,6 +297,13 @@ def find_url(text: str) -> tuple[str, str] | None:
     rest = re.sub(r"\s+", " ", text[:m.start()] + text[m.start() + len(url):]).strip()
     rest = rest if re.search(r"\w", rest) else ""
     return (url, rest) if len(url) > 7 else None
+
+
+def release_browser(st: dict):
+    """Close the From web steps' signed-in browser, if they opened one (nothing of the sign-in is kept)."""
+    if st and st.get("browser"):
+        background_tasks.create(st["browser"].close(), name="close browser")
+        st["browser"] = None
 
 
 def is_text_file(path: str) -> bool:
@@ -1868,8 +1875,8 @@ class Workbench:
                 close_btn = ui.button(icon="close", on_click=lambda: dialog.close()).props("flat dense round size=sm")
             ui.label("Nothing is sent to the AI model: you choose the page and the files, and they are downloaded "
                      "straight into your folder.").classes("muted text-xs")
-            self.web_steps(dialog.close, close_btn.set_enabled)
-        dialog.on("hide", dialog.delete)
+            st = self.web_steps(dialog.close, close_btn.set_enabled)
+        dialog.on("hide", lambda: (release_browser(st), dialog.delete()))
         dialog.open()
 
     def open_web_card(self, url: str, rest: str, original: str) -> bool:
@@ -1899,6 +1906,7 @@ class Workbench:
         return True
 
     def close_web_card(self):
+        release_browser(self.web_state)
         self.web_slot.clear()
         self.web_state = None
 
@@ -1916,7 +1924,7 @@ class Workbench:
         close() ends the workflow; closable(bool) enables its close controls (off while downloading)."""
         opts = webfetch.options()
         st = {"scan": None, "selected": set(), "filter": "All", "results": [], "running": False, "cancel": False,
-              "dest": "project" if self.project else "other", "last_refresh": 0.0}
+              "dest": "project" if self.project else "other", "last_refresh": 0.0, "browser": None}
 
         with ui.stepper().props("vertical flat animated").classes("w-full") as stepper:
             # 1 ---------------------------------------------------------------- web address
@@ -1927,10 +1935,16 @@ class Workbench:
                 ui.label(("Allowed websites: " + ", ".join(allowed)) if allowed else
                          "Any website you type can be opened (limit this in Settings → Web). Only that one page "
                          "is read; no links are followed.").classes("muted text-xs")
+                ui.label("Pages that need a sign-in (SharePoint, Confluence, intranet) open in Microsoft Edge or "
+                         "Chrome: you sign in there yourself, the app never sees your password and keeps nothing "
+                         "after these steps.").classes("muted text-xs")
+                scan_status = ui.label("").classes("text-xs text-primary")
                 scan_msg = ui.label("").classes("err text-xs")
                 with ui.stepper_navigation():
                     scan_btn = ui.button("Scan page", icon="search", on_click=lambda: do_scan()) \
                         .props("unelevated no-caps")
+                    sign_btn = ui.button("Sign in first", icon="login", on_click=lambda: do_scan(browser=True)) \
+                        .props("flat no-caps").tooltip("Open the page in a browser window to sign in, then scan it")
                 url_in.on("keydown.enter", lambda: do_scan())
 
             # 2 ---------------------------------------------------------------- checklist
@@ -1941,15 +1955,26 @@ class Workbench:
                     if not sc:
                         return
                     items = sc["items"]
+                    via = sc.get("via") == "browser"
                     with ui.column().classes("w-full gap-0"):
-                        ui.label(sc["title"]).classes("font-medium ellipsis1 w-full")
+                        with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                            ui.label(sc["title"]).classes("font-medium ellipsis1")
+                            if via:
+                                kinds = {"sharepoint": "SharePoint library", "confluence": "Confluence attachments"}
+                                ui.badge(f"signed-in browser{' · ' + kinds[sc['kind']] if sc['kind'] in kinds else ''}") \
+                                    .props("outline").tooltip("Read through your own sign-in in the browser")
                         ui.label(sc["url"]).classes("muted text-xs ellipsis1 w-full")
+                        if sc.get("kind") == "sharepoint":
+                            ui.label("Files in this folder only; open a subfolder and scan it for its files.") \
+                                .classes("muted text-xs")
                     if not items:
-                        ui.label("No document links (PDF, Word, Excel, PowerPoint, CSV, text) were found on this "
-                                 "page. Pages that need a sign-in, or that build their links with JavaScript, "
-                                 "can't be scanned: download those in your browser and upload them instead.") \
-                            .classes("text-sm")
+                        ui.label("No documents (PDF, Word, Excel, PowerPoint, CSV, text) were found on this page." +
+                                 ("" if via else " If the page builds its links with JavaScript, or shows more "
+                                  "after a sign-in, open it in the browser.")).classes("text-sm")
                         with ui.stepper_navigation():
+                            if not via:
+                                ui.button("Open in the browser", icon="open_in_browser",
+                                          on_click=lambda: do_scan(browser=True)).props("unelevated no-caps")
                             ui.button("Back", on_click=stepper.previous).props("flat no-caps")
                         return
                     types = ["All"] + sorted({i["type"] for i in items})
@@ -2054,8 +2079,8 @@ class Workbench:
                                 ui.icon(icon, size="xs").classes(cls)
                                 ui.label(r["item"]["name"]).classes("ellipsis1 grow")
                                 if r["status"] == "downloading":
-                                    ui.label(file_size(r["done"]) + (f" of {file_size(r['total'])}" if r["total"] else ""))\
-                                        .classes("muted text-xs")
+                                    ui.label((file_size(r["done"]) + (f" of {file_size(r['total'])}" if r["total"] else ""))
+                                             if r["done"] else "downloading…").classes("muted text-xs")
                                 elif r["msg"]:
                                     ui.label(r["msg"]).classes(f"text-xs {'err' if r['status'] == 'failed' else 'muted'} ellipsis1") \
                                         .style("max-width:60%").tooltip(r["msg"])
@@ -2098,29 +2123,45 @@ class Workbench:
 
                 result_view()
 
-        async def do_scan():
+        async def do_scan(browser: bool = False):
+            """The plain scan first; pages that need a sign-in (or browser=True) go through the browser."""
             scan_msg.set_text("")
-            if not (url_in.value or "").strip():
+            stepper.set_value("Web address")        # also when rescanning from the empty checklist
+            url = (url_in.value or "").strip()
+            if not url:
                 scan_msg.set_text("Type or paste a web address.")
                 return
             scan_btn.props("loading")
+            sign_btn.set_enabled(False)
             try:
-                sc = await webfetch.scan(url_in.value)
-                try:
-                    await asyncio.wait_for(webfetch.probe([i for i in sc["items"][:200]]), timeout=20)
-                except asyncio.TimeoutError:
-                    pass
+                sc = None
+                if not browser:
+                    try:
+                        sc = await webfetch.scan(url)
+                    except webfetch.SignInNeeded:
+                        pass
+                if sc is None:
+                    release_browser(st)
+                    st["browser"] = browserfetch.BrowserSession()
+                    sc = await st["browser"].scan(url, scan_status.set_text)
+                else:
+                    try:
+                        await asyncio.wait_for(webfetch.probe([i for i in sc["items"][:200]]), timeout=20)
+                    except asyncio.TimeoutError:
+                        pass
             except webfetch.FetchError as e:
                 scan_msg.set_text(str(e))
                 return
             except httpx.HTTPError as e:
-                scan_msg.set_text(f"Could not open the page: {e.__class__.__name__} {e}".strip())
+                scan_msg.set_text(webfetch.network_error(e, "Could not open the page"))
                 return
             except Exception as e:
                 scan_msg.set_text(f"Could not read the page: {e}")
                 return
             finally:
                 scan_btn.props(remove="loading")
+                sign_btn.set_enabled(True)
+                scan_status.set_text("")
             st.update(scan=sc, filter="All", selected={i["url"] for i in sc["items"] if sc["direct"] and i["allowed"]})
             checklist.refresh()
             stepper.next()
@@ -2171,13 +2212,16 @@ class Workbench:
                     r.update(done=done, total=total)
                     refresh_progress()
                 try:
-                    out = await webfetch.download(r["item"], folder, on_exists.value, progress)
+                    if r["item"].get("via") == "browser" and st["browser"]:
+                        out = await st["browser"].download(r["item"], folder, on_exists.value)
+                    else:
+                        out = await webfetch.download(r["item"], folder, on_exists.value, progress)
                     r.update(status=out["status"], path=out["path"],
                              msg=Path(out["path"]).name if out["status"] == "saved" else "already there")
                 except webfetch.FetchError as e:
                     r.update(status="failed", msg=str(e))
                 except httpx.HTTPError as e:
-                    r.update(status="failed", msg=f"Network error: {e.__class__.__name__} {e}".strip())
+                    r.update(status="failed", msg=webfetch.network_error(e, "Network error"))
                 except OSError as e:
                     r.update(status="failed", msg=f"Could not write the file: {e}")
                 refresh_progress(True)
@@ -2188,6 +2232,7 @@ class Workbench:
             stepper.next()
 
         def restart():
+            release_browser(st)
             st.update(scan=None, selected=set(), results=[])
             checklist.refresh()
             progress_view.refresh()

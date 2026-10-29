@@ -5,17 +5,20 @@ NiceGUI's own browser assets come from the `nicegui` pip package.
 One `Workbench` object per browser tab holds the UI state and calls the backend modules directly.
 """
 import asyncio
+import base64
 import html
 import json
 import re
+import shutil
 import time
+import uuid
 from pathlib import Path
 from urllib.parse import quote
 
 import httpx
 from nicegui import background_tasks, events, ui
 
-from . import browserfetch, chats, citations, documents, knowledge, llm, outputs, projects, settings, webfetch
+from . import browserfetch, chats, citations, documents, knowledge, llm, outputs, preview, projects, settings, webfetch
 from . import files as fs
 
 # ---------------------------------------------------------------- styling
@@ -79,6 +82,8 @@ body.body--dark .t-md, body.body--dark .t-txt { background: #1d3a2a; color: #7fd
 .fs-row { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 6px; width: 100%; }
 .fs-row.click { cursor: pointer; } .fs-row.click:hover { background: var(--wb-bg); }
 .fs-off { opacity: .45; }
+.pv-table { border-collapse: collapse; font-size: 12px; }
+.pv-table td { border: 1px solid var(--wb-border); padding: 2px 6px; white-space: nowrap; }
 .web-card { border: 1px solid var(--wb-accent); box-shadow: none; margin-bottom: 16px; }
 .q-drawer .q-scrollarea__content { width: 100%; max-width: 100%; }
 .fs-row > * { min-width: 0; }
@@ -250,8 +255,22 @@ def claim_before(prefix: str) -> str:
     return re.sub(r"^\s*([-+]|\d+\.)\s+", "", claim).strip()[:600]
 
 
+_CODE = re.compile(r"(```.*?(?:```|$)|`[^`\n]*`)", re.S)
+
+
+def safe_markdown(text: str) -> str:
+    """Model output with raw HTML and images shown as text, so an answer can't make the browser load anything.
+    (A web page or document could tell the model to put chat data into an image or style URL.) Code is unchanged."""
+    parts = _CODE.split(text)
+    for i in range(0, len(parts), 2):
+        p = re.sub(r"!\[([^\]]*)\]\s*[(\[][^)\]]*[)\]]", lambda m: f"[image: {m.group(1) or 'no description'}]", parts[i])
+        parts[i] = re.sub(r"<(?=[A-Za-z/!?])", "&lt;", p)
+    return "".join(parts)
+
+
 def render_answer(text: str, resolve) -> str:
     """Markdown with citations ([C1-p2-13] and common variants) replaced by clickable chips (HTML spans)."""
+    text = safe_markdown(text)
     out, at = [], 0
     for start, end, items in _citation_groups(text, resolve):
         out.append(text[at:start])
@@ -304,6 +323,23 @@ def release_browser(st: dict):
     if st and st.get("browser"):
         background_tasks.create(st["browser"].close(), name="close browser")
         st["browser"] = None
+
+
+_DOWNLOAD_STRONG = re.compile(r"\b(download|grab|scrape)\w*|\bget (?:all |the |these |those |every )*(?:files|pdfs?|"
+                              r"documents|docs|attachments)\b|下载|下下来|拿下来|抓下来|批量", re.I)
+_DOWNLOAD_WEAK = re.compile(r"\b(save|store|keep)\b|保存|存到|存下|存进|存入|另存", re.I)
+_READ = re.compile(r"summar|extract|analy[sz]|compare|translat|explain|list|find|what|which|how|why|tell me|read|"
+                   r"table|number|figure|value|总结|摘要|概括|提取|分析|对比|比较|翻译|解释|找|哪些|多少|什么|读|数值|数据|表格", re.I)
+
+
+def web_intent(url: str, rest: str) -> str:
+    """What a chat message with a link asks for: "download" (the download steps), "read" (the page goes to the
+    model with the message), "attach" (a bare link to a document: attach it), or "choose" (a bare link to a page)."""
+    if _DOWNLOAD_STRONG.search(rest) or (_DOWNLOAD_WEAK.search(rest) and not _READ.search(rest)):
+        return "download"
+    if not rest:
+        return "attach" if webfetch._suffix_of(url) in webfetch.READABLE else "choose"
+    return "read"
 
 
 def is_text_file(path: str) -> bool:
@@ -777,7 +813,7 @@ class Workbench:
                     saved = self.with_sources(path, content)
                     body, sep, sources = saved.partition("\n## Sources\n")
                     # File names like Harborline_Home_Furnishings.pdf would render "_Home_" in italics.
-                    ui.markdown(body + sep + sources.replace("_", "\\_"))
+                    ui.markdown(safe_markdown(body + sep + sources.replace("_", "\\_")))
                 else:
                     ui.code(content, language=None).classes("w-full text-xs")
 
@@ -1227,10 +1263,22 @@ class Workbench:
         text = ((self.input.value or "") if from_input else text).strip()
         if not text or self.pending:
             return
-        if from_input and (found := find_url(text)):      # a link: the download steps, not the model
-            if self.open_web_card(*found, original=text):
-                self.input.value = ""
-            return
+        if from_input and (found := find_url(text)):      # a link: download steps, or the page for the model
+            url, rest = found
+            intent = web_intent(url, rest)
+            if intent == "download":
+                if self.open_web_card(url, rest, original=text):
+                    self.input.value = ""
+                return
+            self.input.value = ""
+            if intent == "choose":
+                self.web_choice(url)
+                return
+            if not await self.read_web(url):
+                self.input.value = text
+                return
+            if intent == "attach":
+                return
         if from_input:
             self.input.value = ""
         chat = self.ensure_chat()
@@ -1512,7 +1560,7 @@ class Workbench:
                 if facts:
                     ui.label(" · ".join(facts)).classes("muted text-xs")
                 with ui.expansion("Show profile").classes("w-full text-sm").props("dense"):
-                    ui.markdown(prof["text"])
+                    ui.markdown(safe_markdown(prof["text"]))
             else:
                 with ui.row().classes("w-full items-center gap-2"):
                     ui.icon("radio_button_unchecked", size="sm").classes("muted")
@@ -1528,7 +1576,7 @@ class Workbench:
                 ui.button(icon="close", on_click=dialog.close).props("flat dense round size=sm")
             ui.label("Sources: " + (", ".join(ex["sources"]) or "none")).classes("muted text-xs")
             with ui.scroll_area().classes("w-full h-[60vh]"):
-                ui.markdown(ex["summary"])
+                ui.markdown(safe_markdown(ex["summary"]))
         dialog.on("hide", dialog.delete)
         dialog.open()
 
@@ -1845,7 +1893,7 @@ class Workbench:
                 dialog.delete()
                 return
             try:
-                p = projects.create(name.value or Path(folder.value.strip()).name, folder.value.strip(),
+                p = projects.create(name.value or "", folder.value.strip(),
                                     instructions.value or "", create_folder.value)
                 break
             except Exception as e:
@@ -1854,8 +1902,11 @@ class Workbench:
         dialog.delete()
         lines = []
         if p.get("reopened"):
-            lines.append(f'This folder already had a project, so "{p["name"]}" was reopened with its saved '
+            lines.append(f'This folder already had a project called "{p["name"]}", so it was reopened with its saved '
                          "instructions and context.")
+        elif p.get("shares_folder_with"):
+            lines.append("This folder is also used by " + ", ".join(f'"{n}"' for n in p["shares_folder_with"]) +
+                         ". The projects share its files; each keeps its own instructions, context and knowledge base.")
         added = [projects.add_upload(p["id"], n, d) for n, d in state["files"] if supported(n)]
         if (paste_text.value or "").strip():
             added.append(projects.add_text(p["id"], paste_title.value or "Pasted text", paste_text.value))
@@ -1890,13 +1941,13 @@ class Workbench:
             with ui.row().classes("w-full items-center gap-2 no-wrap"):
                 ui.icon("travel_explore", color="primary")
                 ui.label("Download documents from this link").classes("font-semibold grow")
-                as_msg = ui.button("Send to the model instead", on_click=lambda: self.web_card_as_message(original)) \
+                as_msg = ui.button("Read the page instead", on_click=lambda: self.web_card_as_message(original, url, rest)) \
                     .props("flat dense no-caps size=sm color=primary") \
-                    .tooltip("Send your message as a normal chat message (the model can't open the link)")
+                    .tooltip("Attach the page's text to the chat and send your message to the model")
                 close_btn = ui.button(icon="close", on_click=self.close_web_card).props("flat dense round size=sm")
-            ui.label("Your message contains a web address, so it was not sent to the AI model. Pick the files and a "
-                     "folder below; they are downloaded straight into it and can then be attached to this chat.") \
-                .classes("muted text-xs")
+            ui.label("Your message asks to download from a web address, so it was not sent to the AI model. Pick "
+                     "the files and a folder below; they are downloaded straight into it and can then be attached "
+                     "to this chat.").classes("muted text-xs")
 
             def closable(on: bool):
                 close_btn.set_enabled(on)
@@ -1910,9 +1961,82 @@ class Workbench:
         self.web_slot.clear()
         self.web_state = None
 
-    async def web_card_as_message(self, text: str):
+    async def web_card_as_message(self, text: str, url: str, rest: str):
         self.close_web_card()
-        await self.send(text)
+        if await self.read_web(url) and rest:
+            await self.send(text)
+
+    def web_choice(self, url: str):
+        """A bare link to a web page: ask whether to read it or download documents from it."""
+        if self.web_state and self.web_state["running"]:
+            self.notify("A download is still running in the chat. Wait for it or stop it first.", type="warning")
+            return
+        self.close_web_card()
+        self.web_state = {"running": False}
+        with self.web_slot, ui.card().classes("w-full gap-2 web-card"):
+            with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                ui.icon("link", color="primary")
+                ui.label(url).classes("font-medium ellipsis1 grow")
+                ui.button(icon="close", on_click=self.close_web_card).props("flat dense round size=sm")
+            ui.label("What should happen with this link?").classes("text-sm")
+            with ui.row().classes("gap-2"):
+                ui.button("Read the page", icon="article", on_click=lambda: self.read_web(url)) \
+                    .props("unelevated no-caps").tooltip("Attach the page's text so you can ask about it "
+                                                         "(summaries, numbers, tables)")
+                ui.button("Download documents from it", icon="download",
+                          on_click=lambda: self.open_web_card(url, "", url)).props("outline no-caps")
+        self.client.run_javascript("setTimeout(() => window.scrollTo(0, document.body.scrollHeight), 100)")
+
+    async def read_web(self, url: str) -> bool:
+        """Attach the web page at url (its text as Markdown, or the document the link points to) to the chat,
+        so the model can answer from it with citations. Pages that need a sign-in go through the browser."""
+        if self.web_state and self.web_state["running"]:
+            self.notify("A download is still running in the chat. Wait for it or stop it first.", type="warning")
+            return False
+        self.close_web_card()
+        st = self.web_state = {"running": True, "browser": None}
+        with self.web_slot, ui.card().classes("w-full gap-1 web-card") as card:
+            with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                spinner = ui.spinner(size="sm")
+                status = ui.label(f"Reading {url} …").classes("text-sm ellipsis1 grow")
+            ui.label("Only this page is read. Its text is attached to the chat, so the answer can cite it.") \
+                .classes("muted text-xs")
+        self.busy = True
+        self.composer.refresh()
+        self.client.run_javascript("setTimeout(() => window.scrollTo(0, document.body.scrollHeight), 100)")
+        folder = settings.UPLOADS_DIR / "web" / str(time.time_ns())
+        error = None
+        try:
+            try:
+                got = await webfetch.read(url, folder)
+            except webfetch.SignInNeeded:
+                st["browser"] = browserfetch.BrowserSession()
+                got = await st["browser"].read(url, folder, status.set_text)
+            doc = await asyncio.to_thread(documents.ingest, Path(got["path"]), got["name"])
+        except webfetch.FetchError as e:
+            error = str(e)
+        except httpx.HTTPError as e:
+            error = webfetch.network_error(e, "Could not open the page")
+        except Exception as e:
+            error = f"Could not read the page: {e}"
+        finally:
+            release_browser(st)
+            st["running"] = False
+            self.busy = False
+        if error:
+            spinner.delete()
+            status.set_text(f"⚠ {error}")
+            status.classes(replace="text-sm err grow")
+            with card, ui.row().classes("gap-2"):
+                ui.button("Download documents from it instead", on_click=lambda: self.open_web_card(url, "", url)) \
+                    .props("flat dense no-caps size=sm color=primary")
+                ui.button("Close", on_click=self.close_web_card).props("flat dense no-caps size=sm")
+            self.composer.refresh()
+            return False
+        self.close_web_card()
+        self.attach_metas([{**documents.meta(doc), "ok": True, "name": got["name"]}])
+        self.set_notice(f"Read {got['url']} and attached it as {got['name']}.")
+        return True
 
     def drop_idle_web_card(self):
         """Switching chat or project: an unfinished card goes away, a running download stays visible."""
@@ -2007,7 +2131,79 @@ class Workbench:
                                 if not i["allowed"]:
                                     ui.label("not an allowed website").classes("muted text-xs")
                                 ui.label(file_size(i["size"]) if i["size"] else "").classes("muted text-xs w-16 text-right")
+                                ui.button(icon="visibility", on_click=lambda i=i: show_preview(i)) \
+                                    .props("flat dense round size=sm").tooltip("Preview").set_enabled(i["allowed"])
+                    preview_view()
                     checklist_nav()
+
+                @ui.refreshable
+                def preview_view():
+                    pv = st.get("preview")
+                    if not pv:
+                        return
+                    item = pv["item"]
+                    with ui.column().classes("w-full gap-1 p-2 mt-2") \
+                            .style("border:1px solid var(--wb-border);border-radius:8px"):
+                        with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                            ui.icon("visibility", size="xs").classes("muted")
+                            type_badge(item["name"])
+                            ui.label(item["name"]).classes("font-medium ellipsis1 grow")
+                            if item["allowed"]:
+                                ui.checkbox("Download this file", value=item["url"] in st["selected"],
+                                            on_change=lambda e, u=item["url"]: select([u], e.value)).props("dense")
+                            ui.button(icon="close", on_click=lambda: (st.update(preview=None), preview_view.refresh())) \
+                                .props("flat dense round size=sm").tooltip("Close the preview")
+                        if pv["status"] == "loading":
+                            with ui.row().classes("items-center gap-2 p-2"):
+                                ui.spinner(size="sm")
+                                ui.label("Loading a preview (the file is fetched and read on this computer, not kept)…") \
+                                    .classes("muted text-xs")
+                            return
+                        r = pv["result"]
+                        with ui.scroll_area().classes("w-full h-96"):
+                            if r["kind"] == "pages":
+                                for png in r["pages"]:
+                                    ui.image("data:image/png;base64," + base64.b64encode(png).decode()) \
+                                        .classes("w-full").style("border:1px solid var(--wb-border);margin-bottom:8px")
+                            elif r["kind"] == "text":
+                                ui.label(r["text"] or "(no text)").classes("whitespace-pre-wrap text-xs")
+                            elif r["kind"] == "table":
+                                for name, rows in r["sheets"]:
+                                    if len(r["sheets"]) > 1:
+                                        ui.label(name).classes("font-medium text-xs pt-1")
+                                    ui.html("<table class='pv-table'>" + "".join(
+                                        "<tr>" + "".join(f"<td>{html.escape(c)}</td>" for c in row) + "</tr>"
+                                        for row in rows) + "</table>")
+                            else:
+                                ui.label(r["reason"]).classes("muted text-sm")
+                        more = {"pages": r.get("total", 0) > len(r.get("pages", [])), "text": r.get("more"),
+                                "table": r.get("more")}.get(r["kind"])
+                        if more:
+                            ui.label(f"First {len(r['pages'])} of {r['total']} pages." if r["kind"] == "pages"
+                                     else "Only the beginning is shown.").classes("muted text-xs")
+
+                async def show_preview(item):
+                    st["preview"] = {"item": item, "status": "loading", "result": None}
+                    preview_view.refresh()
+                    tmp = settings.DATA_DIR / "preview" / uuid.uuid4().hex
+                    try:
+                        tmp.mkdir(parents=True)
+                        if item.get("via") == "browser" and st["browser"]:
+                            out = await st["browser"].download(item, tmp, "replace")
+                        else:
+                            out = await webfetch.download(item, tmp, "replace")
+                        result = await asyncio.to_thread(preview.show, Path(out["path"]))
+                    except webfetch.FetchError as e:
+                        result = {"kind": "none", "reason": str(e)}
+                    except httpx.HTTPError as e:
+                        result = {"kind": "none", "reason": webfetch.network_error(e, "Network error")}
+                    except Exception as e:
+                        result = {"kind": "none", "reason": f"No preview: {e}"}
+                    finally:
+                        shutil.rmtree(tmp, ignore_errors=True)
+                    if (st.get("preview") or {}).get("item") is item:      # still the file being previewed
+                        st["preview"] = {"item": item, "status": "done", "result": result}
+                        preview_view.refresh()
 
                 @ui.refreshable
                 def checklist_nav():
@@ -2162,7 +2358,7 @@ class Workbench:
                 scan_btn.props(remove="loading")
                 sign_btn.set_enabled(True)
                 scan_status.set_text("")
-            st.update(scan=sc, filter="All", selected={i["url"] for i in sc["items"] if sc["direct"] and i["allowed"]})
+            st.update(scan=sc, preview=None, filter="All", selected={i["url"] for i in sc["items"] if sc["direct"] and i["allowed"]})
             checklist.refresh()
             stepper.next()
 
@@ -2233,7 +2429,7 @@ class Workbench:
 
         def restart():
             release_browser(st)
-            st.update(scan=None, selected=set(), results=[])
+            st.update(scan=None, selected=set(), results=[], preview=None)
             checklist.refresh()
             progress_view.refresh()
             result_view.refresh()

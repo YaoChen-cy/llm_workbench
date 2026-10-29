@@ -48,7 +48,7 @@ python start.py        # Windows 用 py start.py
 - **Save as example summary**：把这个回答保存为样本（对话里的文件和回答引用的项目 context 文档作为源文档），可以直接重新学习
 - **Use as summary profile…**：把这个回答编辑后作为 Learned rules
 
-数据保存在 `<项目文件夹>/.workbench/knowledge/`（`examples/<id>/` 含源文件、`summary.md`、`evidence.json`、`notes.json`；`profile.json` 含各版本），随项目文件夹一起复制。
+数据保存在 `<项目文件夹>/.workbench/projects/<项目id>/knowledge/`（旧版本建的项目是 `.workbench/knowledge/`；`examples/<id>/` 含源文件、`summary.md`、`evidence.json`、`notes.json`；`profile.json` 含各版本），随项目文件夹一起复制。
 
 ## 生成文件
 
@@ -72,12 +72,22 @@ python start.py        # Windows 用 py start.py
 右上角 **From web** 打开一个分步骤的流程（项目内外都可以用）：
 
 1. **Web address**：输入网页地址（或直接是一个 PDF 的地址）
-2. **Choose documents**：列出这一页上的文档链接（PDF、Word、Excel、PowerPoint、CSV、文本），显示文件名、链接文字、大小；可按类型筛选、全选；指向其他网站的链接会用橙色标出
+2. **Choose documents**：列出这一页上的文档链接（PDF、Word、Excel、PowerPoint、CSV、文本），显示文件名、链接文字、大小；可按类型筛选、全选；指向其他网站的链接会用橙色标出。每个文件右边的 👁 可以**预览**：PDF 显示前 3 页，Word / PowerPoint / 文本显示开头的文字，Excel / CSV 显示前 40 行；预览时文件只临时取到本机读取，看完就删除，预览里也可以直接勾选下载
 3. **Save to**：存到项目文件夹（可指定子文件夹，默认 `downloads/`），或用 Browse… 选任意文件夹（含共享盘）；同名文件可选跳过 / 两个都保留 / 替换
 4. **Download**：逐个下载，显示进度，可以中途停止
 5. **Done**：列出保存的文件和失败原因；可以直接 **Attach to chat** 或 **Add to project context**，之后就能总结并点击引用定位原文
 
-**也可以直接在 chat 里贴链接**：消息里带网址（`http(s)://…` 或 `www.…`）时，这条消息**不会发给模型**，而是在对话末尾出现同样的步骤卡片，自动扫描这一页（只用第一个网址）。Attach to chat 之后，消息里除网址以外的文字会放回输入框，按 Enter 就能接着问。如果确实想把这条带链接的消息发给模型（模型自己打不开链接），点卡片右上角 **Send to the model instead**。
+**也可以直接在 chat 里贴链接**，程序按消息的意思决定怎么做（只用第一个网址，规则在 `ui.py` 的 `web_intent`，不调用模型）：
+
+| 消息 | 做什么 |
+|---|---|
+| 要**下载**（download、下载、grab、"get all the PDFs"…；只说 save / 保存 且没有总结、提取之类的词时也算） | 消息**不发给模型**，对话末尾出现上面的下载步骤卡片（嵌在 chat 里，不弹窗），自动扫描这一页；Attach to chat 之后，消息里除网址以外的文字会放回输入框 |
+| 要**读网页**（总结、提取数值、分析、比较、问问题…） | 程序读取这一页（只读这一页，不跟链接），把正文转成 Markdown（标题、段落、列表、**表格**都保留，菜单、页脚、脚本去掉）作为文档 attach 到对话，再把消息发给模型；回答可以引用并点开原文。网址直接是 PDF / Word / 文本时，读的就是这个文件 |
+| 只有一个网址 | 文档链接直接 attach；网页链接会问你：**Read the page** 还是 **Download documents from it** |
+
+需要登录的网页（见下）读的时候也一样会弹出登录窗口。下载卡片右上角的 **Read the page instead** 可以改成读网页。
+
+读网页时网页内容会交给模型，网页里可能藏着针对模型的指令。所以程序**不让回答加载任何东西**：回答里的 HTML 和图片只显示为文字（代码块不变），模型就没法把对话内容塞进图片地址发出去；下载也只会从你自己输入的网址开始，模型决定不了。
 
 **安全规则**（这个流程不经过 AI 模型，下载什么由用户自己勾选，所以网页里的内容无法让程序把数据发出去）：
 
@@ -126,7 +136,7 @@ python start.py        # Windows 用 py start.py
 | **Instructions** | 任务说明，自动加进这个项目每个对话的 system prompt |
 | **Context** | 背景资料（样本 summary、术语表、模板……），上传、粘贴文本或从项目文件夹添加都可以；每个对话都会带上，引用编号为 C1、C2… |
 
-项目数据保存在 `<folder>/.workbench/`（`project.json` 和 `context/`），所以项目文件夹是自包含的，可以复制给同事。用 New project 选择一个已有 `.workbench` 的文件夹，会**重新打开**这个项目及其 instructions 和 context。“Remove project from app”只是从列表中移除并删除对话，不会删除文件夹。
+**多个项目可以用同一个文件夹**：它们共用文件夹里的文件，但各自有自己的 instructions、context 和知识库。项目数据保存在 `<folder>/.workbench/projects/<项目id>/`（`project.json`、`context/`、`knowledge/`；旧版本建的项目还在 `<folder>/.workbench/` 下，照常使用），所以项目文件夹是自包含的，可以复制给同事。用 New project 选择一个复制来的文件夹、并填**同样的项目名**，会**重新打开**那个项目及其 instructions 和 context；名字不同就新建一个项目。“Remove project from app”只是从列表中移除并删除对话，不会删除文件夹。
 
 引用编号：`C*` 是项目 context，`D*` 是当前对话里 attach 的文件。
 
@@ -148,7 +158,8 @@ backend/
   knowledge.py   知识库：样本、学习 profile（测量 + 分析 + 合并）、pinned 规则、draft 检查
   alignment.py   summary ↔ 原文对齐与测量（出处、覆盖、长度、原句比例、数字）
   citations.py   宽松的引用识别（各种写法都能点击）
-  webfetch.py    从网页下载文档：扫描链接、检查规则、下载（httpx + lxml，不经过 LLM）
+  webfetch.py    从网页下载文档：扫描链接、检查规则、下载；把网页读成 Markdown 给 chat（httpx + lxml）
+  preview.py     From web 清单里的文件预览（PDF 页面图片、文字、表格）
   browserfetch.py 需要登录的网页：用已安装的 Edge/Chrome（Playwright）登录、列出文件、下载
 data/            运行时数据（git-ignored）：docs/ 解析缓存，chats/ 会话，uploads/ 上传文件
 ```

@@ -114,6 +114,11 @@ def _drive_type(root: str) -> int:
         return 0
 
 
+def _has_project(p: Path) -> bool:
+    w = p / ".workbench"
+    return (w / "project.json").exists() or (w / "projects").is_dir()
+
+
 def list_dirs(path: str | None) -> dict:
     """Subfolders and files of `path` for the project folder picker (names, types and sizes only,
     never file contents). path=None or LOCATIONS lists drives and common folders instead."""
@@ -149,14 +154,14 @@ def list_dirs(path: str | None) -> dict:
     if len(dirs) <= 200:
         for d in dirs:
             try:
-                d["is_project"] = (Path(d["path"]) / ".workbench" / "project.json").exists()
+                d["is_project"] = _has_project(Path(d["path"]))
             except OSError:
                 d["is_project"] = False
     dirs.sort(key=lambda d: d["name"].lower())
     file_list.sort(key=lambda f: f["name"].lower())
     parent = str(p.parent) if p.parent != p else LOCATIONS      # from a drive / share root, go up to Locations
     try:
-        is_project = (p / ".workbench" / "project.json").exists()
+        is_project = _has_project(p)
     except OSError:
         is_project = False
     return {**common, "path": str(p), "parent": parent, "is_project": is_project, "dirs": dirs, "files": file_list}

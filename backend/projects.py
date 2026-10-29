@@ -1,11 +1,14 @@
 """
 Projects: a named task with instructions, context documents and a working folder.
 
-Project data lives inside its folder so the folder is self-contained and can be copied or shared:
-    <folder>/.workbench/project.json
-    <folder>/.workbench/context/      uploaded and pasted context files
-data/projects.json maps project ids to folders. Opening a folder that already has a
-.workbench/project.json re-registers that project with its instructions and context.
+Project data lives inside its folder so the folder is self-contained and can be copied or shared.
+Several projects can use the same folder; each has its own directory:
+    <folder>/.workbench/projects/<id>/project.json
+    <folder>/.workbench/projects/<id>/context/      uploaded and pasted context files
+    <folder>/.workbench/projects/<id>/knowledge/    examples and summary profile (knowledge.py)
+Projects made by earlier versions keep the single-project layout <folder>/.workbench/project.json (+ context/,
+knowledge/) and keep working. data/projects.json maps project ids to folders. Creating a project in a folder that
+has an unregistered project of the same name (a copied or shared folder) re-registers that project instead.
 
 Inside a project, documents can only be read from <folder> and outputs are only written to <folder>.
 """
@@ -32,8 +35,38 @@ def _save_registry(r: dict):
     REGISTRY.write_text(json.dumps(r, indent=1), "utf-8")
 
 
-def _meta_file(folder: Path) -> Path:
-    return folder / META / "project.json"
+def _read(f: Path) -> dict:
+    return json.loads(f.read_text("utf-8"))
+
+
+def meta_dir(folder, pid: str) -> Path:
+    """The directory holding project pid's data inside its folder."""
+    folder = Path(folder)
+    legacy = folder / META / "project.json"
+    try:
+        if legacy.exists() and _read(legacy).get("id") == pid:
+            return folder / META
+    except (OSError, ValueError):
+        pass
+    return folder / META / "projects" / pid
+
+
+def _meta_file(folder, pid: str) -> Path:
+    return meta_dir(folder, pid) / "project.json"
+
+
+def folder_projects(folder) -> list[dict]:
+    """The projects saved in a folder (registered or not)."""
+    folder = Path(folder)
+    files = [folder / META / "project.json"] + sorted((folder / META / "projects").glob("*/project.json"))
+    out = []
+    for f in files:
+        try:
+            if f.exists():
+                out.append(_read(f))
+        except (OSError, ValueError):
+            continue
+    return out
 
 
 def _safe_name(name: str) -> str:
@@ -43,8 +76,10 @@ def _safe_name(name: str) -> str:
 def save(p: dict):
     p["updated"] = time.time()
     folder = Path(p["folder"])
-    data = {k: v for k, v in p.items() if k != "folder"}      # folder may move; never store it
-    _meta_file(folder).write_text(json.dumps(data, ensure_ascii=False, indent=1), "utf-8")
+    data = {k: v for k, v in p.items() if k not in ("folder", "shares_folder_with", "reopened")}  # folder may move
+    meta = _meta_file(folder, p["id"])
+    meta.parent.mkdir(parents=True, exist_ok=True)
+    meta.write_text(json.dumps(data, ensure_ascii=False, indent=1), "utf-8")
 
 
 def create(name: str, folder: str, instructions: str = "", create_folder: bool = False) -> dict:
@@ -63,17 +98,20 @@ def create(name: str, folder: str, instructions: str = "", create_folder: bool =
         raise ValueError(f"Not a folder: {f}")
 
     reg = _registry()
-    if _meta_file(f).exists():                    # existing project folder: reopen it
-        p = json.loads(_meta_file(f).read_text("utf-8"))
-        reg[p["id"]] = str(f)
-        _save_registry(reg)
-        return {**p, "folder": str(f), "reopened": True}
+    name = name.strip() or f.name
+    here = folder_projects(f)
+    for old in here:                              # a copied/shared project folder: reopen that project
+        if old["id"] not in reg and old["name"].strip().lower() == name.lower():
+            reg[old["id"]] = str(f)
+            _save_registry(reg)
+            return {**old, "folder": str(f), "reopened": True}
 
-    (f / META / "context").mkdir(parents=True, exist_ok=True)
     now = time.time()
-    p = {"id": uuid.uuid4().hex[:12], "name": name.strip() or f.name, "instructions": instructions,
-         "created": now, "updated": now, "context": [], "next_label": 1, "folder": str(f)}
+    p = {"id": uuid.uuid4().hex[:12], "name": name, "instructions": instructions,
+         "created": now, "updated": now, "context": [], "next_label": 1, "folder": str(f),
+         "shares_folder_with": [o["name"] for o in here]}
     save(p)
+    (meta_dir(f, p["id"]) / "context").mkdir(parents=True, exist_ok=True)
     reg[p["id"]] = str(f)
     _save_registry(reg)
     return p
@@ -84,9 +122,10 @@ def get(pid: str) -> dict:
     if not folder:
         raise FileNotFoundError(f"unknown project {pid}")
     f = Path(folder)
-    if not _meta_file(f).exists():
+    if not _meta_file(f, pid).exists():
         raise FileNotFoundError(f"Project folder is missing or was moved: {f}")
-    p = json.loads(_meta_file(f).read_text("utf-8"))
+    p = _read(_meta_file(f, pid))
+    p.pop("shares_folder_with", None)
     p["folder"] = str(f)
     for c in p["context"]:                       # re-parse if the doc cache was cleared
         if not (documents.DOCS_DIR / c["doc_id"] / "doc.json").exists() and Path(c["path"]).exists():
@@ -139,7 +178,7 @@ def _add(p: dict, path: Path, name: str, source: str) -> dict:
 
 
 def _context_dest(p: dict, name: str) -> Path:
-    d = Path(p["folder"]) / META / "context"
+    d = meta_dir(p["folder"], p["id"]) / "context"
     d.mkdir(parents=True, exist_ok=True)
     dest, stem, n = d / name, Path(name).stem, 2
     while dest.exists():

@@ -2,6 +2,7 @@
 Downloading documents from a web page the user names (the "Download from web" workflow).
 
     scan(url)                -> the page's document links (or the document itself when the URL is one)
+    read(url, folder)        -> the page as a Markdown file (or the document the URL points to), for the chat
     probe(items)             -> sizes from HEAD requests, where the server answers them
     download(item, folder)   -> one file saved into `folder`
 
@@ -315,3 +316,156 @@ async def download(item: dict, folder: Path, on_exists: str = "skip", progress=N
         finally:
             await r.aclose()
     return {"status": "saved", "path": str(dest)}
+
+
+# ---------------------------------------------------------------- reading a page (for the chat, not the download steps)
+
+READABLE = (".pdf", ".docx", ".txt", ".md")      # what the chat can read (documents.py)
+_DROP = ("script", "style", "noscript", "template", "svg", "canvas", "iframe", "nav", "footer", "aside", "form",
+         "button", "select", "dialog")
+_HEADINGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
+_BLOCKS = _HEADINGS | {"p", "div", "section", "article", "main", "header", "ul", "ol", "li", "table", "pre",
+                       "blockquote", "dl", "dt", "dd", "figure", "figcaption", "hr", "br", "address", "details",
+                       "summary", "tr", "td", "th", "tbody", "thead"}
+
+
+def _ws(t: str) -> str:
+    return re.sub(r"\s+", " ", t or "").strip()
+
+
+def _has_block(el) -> bool:
+    return any(isinstance(d.tag, str) and d.tag in _BLOCKS for d in el.iterdescendants())
+
+
+def _table_md(table) -> str:
+    rows = []
+    for tr in table.xpath(".//tr"):
+        cells = [_ws(c.text_content()).replace("|", "\\|") for c in tr.xpath("./th|./td")]
+        if any(cells):
+            rows.append(cells)
+    if not rows:
+        return ""
+    width = max(len(r) for r in rows)
+    if width == 1:
+        return "\n\n".join(r[0] for r in rows)
+    rows = [r + [""] * (width - len(r)) for r in rows]
+    lines = ["| " + " | ".join(rows[0]) + " |", "|" + " --- |" * width]
+    return "\n".join(lines + ["| " + " | ".join(r) + " |" for r in rows[1:]])
+
+
+def _walk(el, out: list[str]):
+    buf = [el.text or ""]
+
+    def flush():
+        t = re.sub(r" ([.,;:!?)])", r"\1", _ws(" ".join(buf)))      # "sales ." from "<a>sales</a>."
+        if t:
+            out.append(t)
+        buf.clear()
+
+    for child in el:
+        tag = child.tag if isinstance(child.tag, str) else ""
+        if tag == "br":
+            flush()
+        elif tag in _BLOCKS or (tag and _has_block(child)):
+            flush()
+            _block(child, out)
+        elif tag:
+            buf.append(child.text_content())
+        buf.append(child.tail or "")
+    flush()
+
+
+def _block(el, out: list[str]):
+    tag = el.tag
+    if tag in _HEADINGS:
+        if t := _ws(el.text_content()):
+            out.append("#" * int(tag[1]) + " " + t)
+    elif tag == "table":
+        if t := _table_md(el):
+            out.append(t)
+    elif tag == "pre":
+        if t := el.text_content().strip():
+            out.append("```\n" + t + "\n```")
+    elif tag in ("ul", "ol"):
+        n = 0
+        for li in el:
+            if not isinstance(li.tag, str):
+                continue
+            sub: list[str] = []
+            (_walk if li.tag == "li" else _block)(li, sub)
+            if not sub:
+                continue
+            n += 1
+            out.append(("- " if tag == "ul" else f"{n}. ") + sub[0])
+            out.extend(sub[1:])
+    elif tag != "hr":
+        _walk(el, out)
+
+
+def html_to_markdown(text: str, base_url: str = "") -> tuple[str, str]:
+    """(title, Markdown) of a web page: headings, paragraphs, lists and tables; menus, scripts and forms left out."""
+    import lxml.html
+    from lxml import etree
+
+    page = lxml.html.document_fromstring(text or "<html></html>", base_url=base_url or None)
+    title = _ws(page.findtext(".//title") or "")
+    etree.strip_elements(page, *_DROP, etree.Comment, with_tail=False)
+    candidates = page.xpath("//main|//article|//*[@role='main']")
+    body = page.find("body")
+    root = max(candidates, key=lambda e: len(e.text_content())) if candidates else (body if body is not None else page)
+    out: list[str] = []
+    _block(root, out) if root.tag in _BLOCKS else _walk(root, out)
+    return title, "\n\n".join(out)
+
+
+def page_file(folder: Path, url: str, title: str, markdown: str) -> dict:
+    """Save a page's text as a Markdown file for the chat: {"path", "name"}."""
+    title = title or urlsplit(url).hostname or "Web page"
+    name = _safe_name(title[:80], ".md")
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / name
+    path.write_text(f"# {title}\n\nSource: {url}\n\n{markdown}\n", "utf-8")
+    return {"path": str(path), "name": name, "url": url}
+
+
+async def read(url: str, folder: Path) -> dict:
+    """The page at url as a Markdown file in folder, or the document url points to: {"path", "name", "url"}.
+    Raises SignInNeeded when the page asks for a sign-in (the caller then uses browserfetch)."""
+    opts = options()
+    url = check_url(url, opts)
+    async with _client(opts) as client:
+        r = await _open(client, url, opts)
+        try:
+            final = str(r.url)
+            ctype = r.headers.get("content-type", "")
+            suffix = _suffix_of(final, ctype)
+        finally:
+            await r.aclose()
+    if suffix and "html" not in ctype:
+        if suffix not in READABLE:
+            raise FetchError(f"This address is a {DOC_TYPES[suffix][0]} file, which can't be read in a chat. "
+                             "Ask to download it instead (for example: \"download the files from …\").")
+        item = _item(final, suffix, "", (urlsplit(final).hostname or "").lower(), opts)
+        out = await download(item, folder, "keep")
+        return {"path": out["path"], "name": Path(out["path"]).name, "url": final}
+    if "html" not in ctype and not ctype.startswith("text/"):
+        raise FetchError(f"This address is neither a web page nor a readable document ({ctype.split(';')[0]}).")
+    async with _client(opts) as client:          # read the page itself (the first request only looked at the type)
+        r = await _open(client, url, opts)
+        try:
+            final, charset, body = str(r.url), r.charset_encoding, bytearray()
+            async for chunk in r.aiter_bytes():
+                body += chunk
+                if len(body) > MAX_PAGE_BYTES:
+                    break
+        finally:
+            await r.aclose()
+    text = bytes(body).decode(charset or "utf-8", "replace")
+    if "html" not in ctype:
+        return page_file(folder, final, Path(urlsplit(final).path).name, text)
+    if re.search(r"<input[^>]+type\s*=\s*[\"']?password", text, re.I):
+        raise SignInNeeded("The page is a sign-in form.")
+    title, md = html_to_markdown(text, final)
+    if len(md) < 200 and re.search(r"<script", text, re.I):
+        raise SignInNeeded("The page builds its content with JavaScript.")   # read it in the browser instead
+    return page_file(folder, final, title, md)

@@ -2,7 +2,7 @@
 Project knowledge base: examples (source documents + the expected summary) and the summary profile
 learned from them. Everything lives in the project folder so it travels with it:
 
-    <folder>/.workbench/knowledge/
+    <folder>/.workbench/projects/<id>/knowledge/  (.workbench/knowledge/ for older single-project folders)
         examples/<id>/example.json   {id, name, created, origin: upload|chat, sources: [file names], summary_file}
         examples/<id>/<source files>, summary.md   (the expected summary as Markdown)
         examples/<id>/evidence.json  alignment evidence measured in code (alignment.py), cached
@@ -91,7 +91,7 @@ Write the qualitative rules a writer needs to produce indistinguishable summarie
 # ---------------------------------------------------------------- storage
 
 def _kdir(project: dict) -> Path:
-    d = Path(project["folder"]) / projects.META / "knowledge"
+    d = projects.meta_dir(project["folder"], project["id"]) / "knowledge"
     (d / "examples").mkdir(parents=True, exist_ok=True)
     return d
 

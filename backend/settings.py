@@ -49,7 +49,7 @@ DEFAULTS = {
         },
     },
     # Folders the file browser may read. Everything outside them is refused.
-    "allowed_folders": [str(ROOT / "cip" / "input"), str(ROOT / "cip" / "eval")],
+    "allowed_folders": [],
 }
 
 _lock = threading.Lock()

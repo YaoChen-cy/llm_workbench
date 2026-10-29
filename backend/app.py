@@ -18,7 +18,10 @@ from pydantic import BaseModel
 from . import chats, documents, llm, projects, settings
 from . import files as fs
 
-app = FastAPI(title="LLM Workbench")
+# No OpenTelemetry tracing/metrics/logs: nothing about requests leaves this process, whatever OTEL_* variables
+# the computer has set.
+app = FastAPI(title="LLM Workbench", telemetry={"tracing": False, "metrics": False, "logs": False,
+                                               "operation_spans": False, "auto_configure": False})
 
 
 def _err(e: Exception):

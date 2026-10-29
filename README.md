@@ -2,15 +2,13 @@
 
 本地运行的 LLM 交互界面（英文 UI）：可以浏览本地文件夹、给对话 attach 多个文件，回答中的每个事实都带来源引用，鼠标悬停即可看到原文。
 
-> 原来的 CIP 月度总结流程移到了 [`cip/`](cip/README.md)，用法不变，只是要先 `cd cip`。M3 会把它改造成第一个 Project。
-
 ## 启动
 
 ```bash
 python start.py        # Windows 用 py start.py
 ```
 
-首次运行会在 `.venv` 中建 Python 环境并安装 `requirements.txt`（需要 Python 3.10+，以及 pip 能访问 PyPI 或公司镜像；有代理时设置 `HTTPS_PROXY` 或 `PIP_INDEX_URL`），然后自动打开 http://localhost:8000 。可选参数：`--port 8001`、`--no-browser`、`--reinstall`。
+首次运行会在 `.venv` 中建 Python 环境并安装 `requirements.txt`（版本固定在 `constraints.txt`，需要 Python 3.11+，以及 pip 能访问 PyPI 或公司镜像；有代理时设置 `HTTPS_PROXY` 或 `PIP_INDEX_URL`），然后自动打开 http://localhost:8000 。可选参数：`--port 8001`、`--no-browser`、`--reinstall`。
 
 **整个应用都是 Python**：界面用 [NiceGUI](https://github.com/zauberzeug/nicegui) 编写（`backend/ui.py`），它的浏览器端文件由 pip 安装，仓库里没有 JS/CSS/HTML 文件，也不需要 Node.js。
 
@@ -106,7 +104,6 @@ backend/
   alignment.py   summary ↔ 原文对齐与测量（出处、覆盖、长度、原句比例、数字）
   citations.py   宽松的引用识别（各种写法都能点击）
 data/            运行时数据（git-ignored）：docs/ 解析缓存，chats/ 会话，uploads/ 上传文件
-cip/             原 CIP 月度总结流程
 ```
 
 > 早期的 React 版界面保留在 git 分支 `feat/m1-chat-ui` 上。

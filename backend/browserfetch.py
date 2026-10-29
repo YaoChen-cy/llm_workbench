@@ -5,6 +5,7 @@ on this computer (Microsoft Edge, else Google Chrome), driven by Playwright.
     session = BrowserSession()
     await session.scan(url, status)            -> same shape as webfetch.scan()
     await session.download(item, folder, ...)  -> same shape as webfetch.download()
+    await session.read(url, folder, status)    -> same shape as webfetch.read() (the page's text, for the chat)
     await session.close()
 
 How it works:
@@ -98,6 +99,11 @@ class BrowserSession:
 
     async def download(self, item: dict, folder: Path, on_exists: str = "skip") -> dict:
         return await _runner().run(self._download(item, folder, on_exists))
+
+    async def read(self, url: str, folder: Path, status=None) -> dict:
+        main = asyncio.get_running_loop()
+        say = (lambda text: main.call_soon_threadsafe(status, text)) if status else (lambda text: None)
+        return await _runner().run(self._read(url, folder, say))
 
     async def close(self):
         await _runner().run(self._close())
@@ -197,7 +203,8 @@ class BrowserSession:
 
     # ---------------------------------------------------------------- scan
 
-    async def _scan(self, url: str, say) -> dict:
+    async def _open_page(self, url: str, say) -> bool:
+        """Open url (signing in when asked) as self.page. True when url is a file the browser downloads."""
         opts = webfetch.options()
         url = webfetch.check_url(url, opts)
         target = _host(url)
@@ -206,19 +213,43 @@ class BrowserSession:
         ctx = await headless.new_context(accept_downloads=True)
         page = await ctx.new_page()
         resp, is_file = await self._goto(page, url)
-        if is_file:
-            self.context, self.page = ctx, page
-            suffix = webfetch._suffix_of(url)
-            if not suffix:
-                raise FetchError("This address downloads a file that is not a supported document.")
-            return {"url": url, "title": webfetch._name_of(url, suffix), "direct": True, "via": "browser",
-                    "kind": "file", "items": [{**webfetch._item(url, suffix, "", target, opts), "via": "browser"}]}
-        if await self._needs_sign_in(page, resp, target):
+        if not is_file and await self._needs_sign_in(page, resp, target):
             await ctx.close()
             ctx, page = await self._sign_in(url, target, headless, say)
         self.context, self.page = ctx, page
+        if not is_file:
+            webfetch.check_url(page.url, opts)   # where the page ended up must be allowed too
+        return is_file
+
+    def _file_item(self, url: str, opts) -> dict:
+        suffix = webfetch._suffix_of(url)
+        if not suffix:
+            raise FetchError("This address downloads a file that is not a supported document.")
+        return {**webfetch._item(url, suffix, "", _host(url), opts), "via": "browser"}
+
+    async def _read(self, url: str, folder: Path, say) -> dict:
+        opts = webfetch.options()
+        url = webfetch.check_url(url, opts)
+        is_file = await self._open_page(url, say)
+        if is_file or webfetch._suffix_of(self.page.url) in webfetch.DOC_TYPES:     # a document, not a page
+            item = self._file_item(url if is_file else self.page.url, opts)
+            if item["suffix"] not in webfetch.READABLE:
+                raise FetchError(f"This address is a {item['type']} file, which can't be read in a chat.")
+            out = await self._download(item, folder, "keep")
+            return {"path": out["path"], "name": Path(out["path"]).name, "url": url}
+        say("Reading the page…")
+        title, md = webfetch.html_to_markdown(await self.page.content(), self.page.url)
+        return webfetch.page_file(folder, self.page.url, title or await self.page.title(), md)
+
+    async def _scan(self, url: str, say) -> dict:
+        opts = webfetch.options()
+        url = webfetch.check_url(url, opts)
+        if await self._open_page(url, say):
+            item = self._file_item(url, opts)
+            return {"url": url, "title": item["name"], "direct": True, "via": "browser", "kind": "file",
+                    "items": [item]}
+        page = self.page
         final = page.url
-        webfetch.check_url(final, opts)     # where the page ended up must be allowed too
         say("Listing the documents…")
         info = await page.evaluate(_PAGE_INFO)
         kind, items = "page", []

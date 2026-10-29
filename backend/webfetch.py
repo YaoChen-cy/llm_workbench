@@ -60,6 +60,22 @@ class FetchError(Exception):
     pass
 
 
+class SignInNeeded(FetchError):
+    """The page asks for a sign-in: the From web steps then open it in the browser (browserfetch)."""
+
+
+# Sign-in services a company site may send the browser to
+LOGIN_HOSTS = ("login.microsoftonline.com", "login.microsoft.com", "login.windows.net", "login.live.com",
+               "id.atlassian.com", "okta.com", "oktapreview.com", "onelogin.com", "pingone.com", "duosecurity.com",
+               "accounts.google.com")
+
+
+def is_login_host(host: str) -> bool:
+    host = host.lower().rstrip(".")
+    return any(host == d or host.endswith("." + d) for d in LOGIN_HOSTS) or \
+        bool(re.match(r"^(adfs|sts|sso|login|auth|signin)\d*[.-]", host))
+
+
 # ---------------------------------------------------------------- rules
 
 def options() -> dict:
@@ -125,11 +141,12 @@ async def _open(client: httpx.AsyncClient, url: str, opts: dict, method: str = "
         if r.status_code in (301, 302, 303, 307, 308) and "location" in r.headers:
             await r.aclose()
             url = urljoin(url, r.headers["location"])
+            if is_login_host(urlsplit(url).hostname or ""):
+                raise SignInNeeded("The site sends you to a sign-in page.")
             continue
         if r.status_code in (401, 403):
             await r.aclose()
-            raise FetchError(f"The site refused access (HTTP {r.status_code}); it may need a sign-in. "
-                             "Download it in your browser and upload it instead.")
+            raise SignInNeeded(f"The site refused access (HTTP {r.status_code}); it needs a sign-in.")
         if r.status_code >= 400:
             await r.aclose()
             raise FetchError(f"The site answered HTTP {r.status_code}.")
@@ -190,6 +207,8 @@ async def scan(url: str) -> dict:
                                              base_url=final)
     except (ValueError, LookupError):
         page = lxml.html.document_fromstring(bytes(body) or b"<html></html>", base_url=final)
+    if page.xpath("//input[@type='password']"):
+        raise SignInNeeded("The page is a sign-in form.")
     page.make_links_absolute(final, resolve_base_href=True)
     title = (page.findtext(".//title") or "").strip() or host
     items, seen = [], set()

@@ -88,7 +88,23 @@ python start.py        # Windows 用 py start.py
 - 文件只写进你选的文件夹（不限制文件大小和个数）
 - **Settings → Web**：允许的网站（每行一个，留空 = 你输入的任何网站；`company.com` 也允许 `www.company.com`）、是否使用系统 / 公司代理
 
-需要登录、或者链接是 JavaScript 动态生成的网页扫不出文档，这种情况请在浏览器里下载后上传。
+### 需要登录的网页（SharePoint、Confluence、内网）
+
+扫描时如果网页要求登录（跳到登录页、出现密码框、或返回 401/403），会自动改用电脑上装的 **Microsoft Edge**（没有就用 Chrome），由 Playwright 控制：
+
+1. 先在后台（不显示窗口）打开网页
+2. 需要登录时弹出一个浏览器窗口，你在里面正常登录（SSO、MFA 都可以）；回到原网站后窗口自动关闭，后台带着这次登录继续。如果网站不接受后台浏览器，窗口会保持打开，下载完再关
+3. 找文件：
+   - **SharePoint 文档库**：通过 SharePoint 自己的 REST 接口列出当前文件夹的文件（不含子文件夹）
+   - **Confluence 页面**：列出页面的附件
+   - 其他网页：读取 JavaScript 运行后页面里的文档链接
+4. 文件由浏览器下载，再做和普通下载一样的检查（类型、文件开头、只写进选定文件夹）
+
+也可以直接点 **Sign in first** 先登录再扫描；普通扫描找不到文档时（比如链接是 JavaScript 生成的），可以点 **Open in the browser** 再试。
+
+- 每次都用一个全新的临时浏览器配置，只存在内存里；流程结束（Close、Another page、关掉卡片或对话框）时浏览器关闭，登录信息不保留，下次需要重新登录
+- 密码只在浏览器窗口里输入，程序看不到；AI 模型不参与；Settings → Web 的允许网站规则同样适用
+- 不会运行 `playwright install`，也不下载 Playwright 自带的浏览器，只用已安装的 Edge / Chrome
 
 ## 来源定位（M2）
 
@@ -133,6 +149,7 @@ backend/
   alignment.py   summary ↔ 原文对齐与测量（出处、覆盖、长度、原句比例、数字）
   citations.py   宽松的引用识别（各种写法都能点击）
   webfetch.py    从网页下载文档：扫描链接、检查规则、下载（httpx + lxml，不经过 LLM）
+  browserfetch.py 需要登录的网页：用已安装的 Edge/Chrome（Playwright）登录、列出文件、下载
 data/            运行时数据（git-ignored）：docs/ 解析缓存，chats/ 会话，uploads/ 上传文件
 ```
 

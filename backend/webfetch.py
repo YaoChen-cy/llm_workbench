@@ -12,10 +12,13 @@ Safety rules (the LLM is not involved; the user types the URL and ticks the file
 - only document types (PDF, Word, Excel, PowerPoint, CSV, text); the file's first bytes must match its type,
   so a login page saved as "report.pdf" is refused
 - files are written only into the chosen folder (no size or count limits)
-Uses the system proxy settings (company proxy) unless Settings → Web says otherwise.
+Uses the system proxy settings (company proxy) unless Settings → Web says otherwise, and the system's trusted
+certificates (Windows certificate store / macOS Keychain), so internal sites signed by the company's own root
+certificate open as they do in the browser. Certificates are always verified.
 """
 import asyncio
 import re
+import ssl
 from pathlib import Path
 from urllib.parse import unquote, urldefrag, urljoin, urlsplit
 
@@ -89,8 +92,27 @@ def check_url(url: str, opts: dict | None = None) -> str:
     return url
 
 
+def _ssl_context() -> ssl.SSLContext | bool:
+    """The operating system's certificate store (what the browser trusts), else Python's own list (certifi)."""
+    try:
+        import truststore
+    except ImportError:
+        return True
+    return truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+
+def network_error(e: Exception, prefix: str) -> str:
+    """A readable message for a failed connection."""
+    text = str(e)
+    if "certificate" in text.lower() or "CERTIFICATE_VERIFY_FAILED" in text:
+        return ("The site's security certificate is not trusted by this computer, so it was not opened. If the page "
+                f"opens in your browser without a warning, ask IT to install the company's root certificate. ({text})")
+    return f"{prefix}: {e.__class__.__name__} {text}".strip()
+
+
 def _client(opts: dict) -> httpx.AsyncClient:
     return httpx.AsyncClient(follow_redirects=False, timeout=TIMEOUT, trust_env=bool(opts.get("use_system_proxy", True)),
+                             verify=_ssl_context(),
                              headers={"User-Agent": USER_AGENT})
 
 

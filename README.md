@@ -83,6 +83,7 @@ python start.py        # Windows 用 py start.py
 
 - 只用普通的 GET/HEAD 请求：不执行 JavaScript、不保留 cookie、不提交表单，只读你输入的那一页，不会继续跟链接
 - 只接受 http/https；带用户名密码的地址会被拒绝；重定向最多 5 次，每一跳都重新检查
+- HTTPS 证书始终验证，用的是系统证书库（Windows 证书存储 / macOS 钥匙串，通过 `truststore`），和浏览器一样信任公司根证书，所以公司内网网站也能打开；证书不被信任的网站会被拒绝
 - 只下载文档类型，并检查文件开头确实是该格式（比如登录页面冒充的 "report.pdf" 会被拒绝）
 - 文件只写进你选的文件夹（不限制文件大小和个数）
 - **Settings → Web**：允许的网站（每行一个，留空 = 你输入的任何网站；`company.com` 也允许 `www.company.com`）、是否使用系统 / 公司代理

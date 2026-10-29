@@ -2114,7 +2114,7 @@ class Workbench:
                 scan_msg.set_text(str(e))
                 return
             except httpx.HTTPError as e:
-                scan_msg.set_text(f"Could not open the page: {e.__class__.__name__} {e}".strip())
+                scan_msg.set_text(webfetch.network_error(e, "Could not open the page"))
                 return
             except Exception as e:
                 scan_msg.set_text(f"Could not read the page: {e}")
@@ -2177,7 +2177,7 @@ class Workbench:
                 except webfetch.FetchError as e:
                     r.update(status="failed", msg=str(e))
                 except httpx.HTTPError as e:
-                    r.update(status="failed", msg=f"Network error: {e.__class__.__name__} {e}".strip())
+                    r.update(status="failed", msg=webfetch.network_error(e, "Network error"))
                 except OSError as e:
                     r.update(status="failed", msg=f"Could not write the file: {e}")
                 refresh_progress(True)

@@ -2012,7 +2012,7 @@ class Workbench:
         try:
             try:
                 got = await webfetch.read(url, folder)
-            except webfetch.SignInNeeded:
+            except webfetch.BrowserNeeded:
                 st["browser"] = browserfetch.BrowserSession()
                 got = await st["browser"].read(url, folder, status.set_text)
             doc = await asyncio.to_thread(documents.ingest, Path(got["path"]), got["name"])
@@ -2337,7 +2337,7 @@ class Workbench:
                 if not browser:
                     try:
                         sc = await webfetch.scan(url)
-                    except webfetch.SignInNeeded:
+                    except webfetch.BrowserNeeded:
                         pass
                 if sc is None:
                     release_browser(st)

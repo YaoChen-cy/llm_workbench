@@ -67,6 +67,26 @@ python start.py        # Windows 用 py start.py
 
 实现方式：system prompt 告诉模型用 `<file path="名字.扩展名">…</file>` 包住文件内容（`backend/outputs.py`）。
 
+## 从网页下载文档（From web）
+
+右上角 **From web** 打开一个分步骤的流程（项目内外都可以用）：
+
+1. **Web address**：输入网页地址（或直接是一个 PDF 的地址）
+2. **Choose documents**：列出这一页上的文档链接（PDF、Word、Excel、PowerPoint、CSV、文本），显示文件名、链接文字、大小；可按类型筛选、全选；指向其他网站的链接会用橙色标出
+3. **Save to**：存到项目文件夹（可指定子文件夹，默认 `downloads/`），或用 Browse… 选任意文件夹（含共享盘）；同名文件可选跳过 / 两个都保留 / 替换
+4. **Download**：逐个下载，显示进度，可以中途停止
+5. **Done**：列出保存的文件和失败原因；可以直接 **Attach to chat** 或 **Add to project context**，之后就能总结并点击引用定位原文
+
+**安全规则**（这个流程不经过 AI 模型，下载什么由用户自己勾选，所以网页里的内容无法让程序把数据发出去）：
+
+- 只用普通的 GET/HEAD 请求：不执行 JavaScript、不保留 cookie、不提交表单，只读你输入的那一页，不会继续跟链接
+- 只接受 http/https；带用户名密码的地址会被拒绝；重定向最多 5 次，每一跳都重新检查
+- 只下载文档类型，并检查文件开头确实是该格式（比如登录页面冒充的 "report.pdf" 会被拒绝）
+- 单个文件大小和每次下载数量有上限；文件只写进你选的文件夹
+- **Settings → Web**：允许的网站（每行一个，留空 = 你输入的任何网站；`company.com` 也允许 `www.company.com`）、大小和数量上限、是否使用系统 / 公司代理
+
+需要登录、或者链接是 JavaScript 动态生成的网页扫不出文档，这种情况请在浏览器里下载后上传。
+
 ## 来源定位（M2）
 
 点击回答中的引用标签（如 `D1 · p.2`），右侧会打开 **Source** 面板：
@@ -105,10 +125,11 @@ backend/
   documents.py   通用解析（PDF/DOCX/TXT/MD）、引用句子定位、带高亮的页面渲染
   chats.py       会话存储、prompt 拼装、超长文档的段落筛选
   projects.py    项目：instructions、context、文件夹沙盒、输出写入
-  outputs.py     模型生成的文件：解析 <file> 块、Markdown 转 Word
+  outputs.py     模型生成的文件：解析 <file> 块、Markdown 转 Word / Excel / PowerPoint
   knowledge.py   知识库：样本、学习 profile（测量 + 分析 + 合并）、pinned 规则、draft 检查
   alignment.py   summary ↔ 原文对齐与测量（出处、覆盖、长度、原句比例、数字）
   citations.py   宽松的引用识别（各种写法都能点击）
+  webfetch.py    从网页下载文档：扫描链接、检查规则、下载（httpx + lxml，不经过 LLM）
 data/            运行时数据（git-ignored）：docs/ 解析缓存，chats/ 会话，uploads/ 上传文件
 ```
 

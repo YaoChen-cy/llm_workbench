@@ -12,9 +12,10 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 
+import httpx
 from nicegui import events, ui
 
-from . import chats, citations, documents, knowledge, llm, outputs, projects, settings
+from . import chats, citations, documents, knowledge, llm, outputs, projects, settings, webfetch
 from . import files as fs
 
 # ---------------------------------------------------------------- styling
@@ -346,6 +347,85 @@ async def ask_text(title: str, value: str, ok: str = "OK") -> str | None:
 
 # ---------------------------------------------------------------- the page
 
+class FolderPicker:
+    """Inline folder browser (drives, network drives, common folders, any folder) that fills a text input.
+    Create it, call .view() where it should appear, and .toggle() from a Browse… button."""
+
+    def __init__(self, target, on_pick=None):
+        self.target, self.on_pick = target, on_pick
+        self.open, self.listing, self.error = False, None, ""
+
+    async def toggle(self):
+        self.open = not self.open
+        self.view.refresh()
+        if self.open:
+            await self.browse((self.target.value or "").strip() or None)
+
+    async def browse(self, path):
+        # Network shares can be slow: list them off the UI thread.
+        try:
+            self.listing, self.error = await asyncio.to_thread(fs.list_dirs, path), ""
+        except Exception as e:
+            self.error = str(e)
+            if not self.listing:
+                self.listing = await asyncio.to_thread(fs.list_dirs, None)
+        self.view.refresh()
+
+    def pick(self, path):
+        self.target.value = path
+        self.open = False
+        self.view.refresh()
+        if self.on_pick:
+            self.on_pick(path)
+
+    @ui.refreshable
+    def view(self):
+        if not self.open:
+            return
+        lst = self.listing
+        with ui.column().classes("w-full gap-0").style(
+                "border:1px solid var(--wb-border);border-radius:9px;background:var(--wb-bg)"):
+            if self.error:
+                ui.label(self.error).classes("err text-xs p-2")
+            if not lst:
+                return
+            at_locations = lst["path"] == lst["locations"]
+            with ui.row().classes("w-full items-center gap-1 p-2 no-wrap").style("border-bottom:1px solid var(--wb-border)"):
+                ui.button(icon="arrow_upward", on_click=lambda: self.browse(lst["parent"])) \
+                    .props("outline dense size=sm").tooltip("Up one level").set_enabled(bool(lst["parent"]))
+                ui.button("Locations", icon="storage", on_click=lambda: self.browse(lst["locations"])) \
+                    .props("outline dense no-caps size=sm").tooltip("Drives, network drives and common folders")
+                ui.label("Drives, network drives and common folders" if at_locations else lst["path"]) \
+                    .classes("text-xs muted ellipsis1").style("direction:rtl;text-align:left")
+            with ui.scroll_area().classes("w-full h-56"):
+                if not lst["dirs"] and not lst["files"]:
+                    ui.label("This folder is empty.").classes("muted text-xs p-2")
+                icons = {"home": "home", "drive": "storage", "network": "lan", "cloud": "cloud", "folder": "folder"}
+                for d in lst["dirs"]:
+                    with ui.element("div").classes("fs-row click").on("click", lambda p=d["path"]: self.browse(p)) \
+                            .on("dblclick", lambda p=d["path"]: self.pick(p)):
+                        ui.icon(icons.get(d.get("kind"), "folder"), size="xs").classes("muted")
+                        ui.label(d["name"]).classes("ellipsis1 grow")
+                        if d["is_project"]:
+                            ui.badge("project").props("outline")
+                for f in lst["files"]:
+                    with ui.element("div").classes(f"fs-row {'' if f['supported'] else 'fs-off'}"):
+                        type_badge(f["name"])
+                        ui.label(f["name"]).classes("ellipsis1 grow")
+                        ui.label(file_size(f["size"])).classes("muted text-xs")
+            with ui.row().classes("w-full items-center gap-2 p-2").style("border-top:1px solid var(--wb-border)"):
+                nd, nf = len(lst["dirs"]), len(lst["files"])
+                readable = sum(f["supported"] for f in lst["files"])
+                if at_locations:
+                    ui.label("Shared folder not listed? Type its path in the Folder box, e.g. "
+                             "\\\\server\\share\\team or S:\\Team, then click Browse….").classes("muted text-xs")
+                else:
+                    ui.button("Use this folder", on_click=lambda: self.pick(lst["path"])).props("unelevated no-caps dense")
+                    ui.label(f"{nd} folder{'s' if nd != 1 else ''} · {nf} file{'s' if nf != 1 else ''}"
+                             + (f" ({readable} readable)" if nf else "") + " · double-click a folder to pick it") \
+                        .classes("muted text-xs")
+
+
 class Workbench:
     def __init__(self):
         self.project: dict | None = None
@@ -499,6 +579,8 @@ class Workbench:
         s = settings.load()
         ui.select({k: f"{p['label']} · {p['model']}" for k, p in s["providers"].items()}, value=s["active_provider"],
                   on_change=self.change_provider).props("dense outlined options-dense").classes("w-64")
+        ui.button("From web", icon="travel_explore", on_click=self.web_download_dialog) \
+            .props("outline no-caps").tooltip("Download documents from a web page")
         if self.chat or not self.project:
             ui.button("Files", icon="folder_open", on_click=lambda: self.toggle_right("files")) \
                 .props(f"{'unelevated' if self.right == 'files' else 'outline'} no-caps")
@@ -1658,7 +1740,7 @@ class Workbench:
     # ---------- new project dialog
 
     async def new_project_dialog(self):
-        state = {"picking": False, "listing": None, "files": [], "error": ""}
+        state = {"files": []}
 
         with self.root, ui.dialog().props("persistent") as dialog, ui.card().classes("w-[700px] max-w-full gap-3"):
             with ui.row().classes("w-full items-center justify-between"):
@@ -1670,77 +1752,10 @@ class Workbench:
             with ui.row().classes("w-full items-center gap-2 no-wrap"):
                 folder = ui.input(placeholder="/Users/you/Documents/cip  or  C:\\Work\\cip").classes("grow") \
                     .props("outlined dense")
-                ui.button("Browse…", on_click=lambda: toggle_picker()).props("outline no-caps")
+                picker = FolderPicker(folder)
+                ui.button("Browse…", on_click=lambda: picker.toggle()).props("outline no-caps")
 
-            @ui.refreshable
-            def picker():
-                if not state["picking"]:
-                    return
-                lst = state["listing"]
-                with ui.column().classes("w-full gap-0").style(
-                        "border:1px solid var(--wb-border);border-radius:9px;background:var(--wb-bg)"):
-                    if state["error"]:
-                        ui.label(state["error"]).classes("err text-xs p-2")
-                    if not lst:
-                        return
-                    at_locations = lst["path"] == lst["locations"]
-                    with ui.row().classes("w-full items-center gap-1 p-2 no-wrap").style("border-bottom:1px solid var(--wb-border)"):
-                        ui.button(icon="arrow_upward", on_click=lambda: browse(lst["parent"])) \
-                            .props("outline dense size=sm").tooltip("Up one level").set_enabled(bool(lst["parent"]))
-                        ui.button("Locations", icon="storage", on_click=lambda: browse(lst["locations"])) \
-                            .props("outline dense no-caps size=sm").tooltip("Drives, network drives and common folders")
-                        ui.label("Drives, network drives and common folders" if at_locations else lst["path"]) \
-                            .classes("text-xs muted ellipsis1").style("direction:rtl;text-align:left")
-                    with ui.scroll_area().classes("w-full h-56"):
-                        if not lst["dirs"] and not lst["files"]:
-                            ui.label("This folder is empty.").classes("muted text-xs p-2")
-                        icons = {"home": "home", "drive": "storage", "network": "lan", "cloud": "cloud", "folder": "folder"}
-                        for d in lst["dirs"]:
-                            with ui.element("div").classes("fs-row click").on("click", lambda p=d["path"]: browse(p)) \
-                                    .on("dblclick", lambda p=d["path"]: pick(p)):
-                                ui.icon(icons.get(d.get("kind"), "folder"), size="xs").classes("muted")
-                                ui.label(d["name"]).classes("ellipsis1 grow")
-                                if d["is_project"]:
-                                    ui.badge("project").props("outline")
-                        for f in lst["files"]:
-                            with ui.element("div").classes(f"fs-row {'' if f['supported'] else 'fs-off'}"):
-                                type_badge(f["name"])
-                                ui.label(f["name"]).classes("ellipsis1 grow")
-                                ui.label(file_size(f["size"])).classes("muted text-xs")
-                    with ui.row().classes("w-full items-center gap-2 p-2").style("border-top:1px solid var(--wb-border)"):
-                        nd, nf = len(lst["dirs"]), len(lst["files"])
-                        readable = sum(f["supported"] for f in lst["files"])
-                        if at_locations:
-                            ui.label("Shared folder not listed? Type its path in the Folder box, e.g. "
-                                     "\\\\server\\share\\team or S:\\Team, then click Browse….").classes("muted text-xs")
-                        else:
-                            ui.button("Use this folder", on_click=lambda: pick(lst["path"])).props("unelevated no-caps dense")
-                            ui.label(f"{nd} folder{'s' if nd != 1 else ''} · {nf} file{'s' if nf != 1 else ''}"
-                                     + (f" ({readable} readable)" if nf else "") + " · double-click a folder to pick it") \
-                                .classes("muted text-xs")
-
-            async def browse(path):
-                # Network shares can be slow: list them off the UI thread.
-                try:
-                    state["listing"], state["error"] = await asyncio.to_thread(fs.list_dirs, path), ""
-                except Exception as e:
-                    state["error"] = str(e)
-                    if not state["listing"]:
-                        state["listing"] = await asyncio.to_thread(fs.list_dirs, None)
-                picker.refresh()
-
-            async def toggle_picker():
-                state["picking"] = not state["picking"]
-                picker.refresh()
-                if state["picking"]:
-                    await browse(folder.value.strip() or None)
-
-            def pick(path):
-                folder.value = path
-                state["picking"] = False
-                picker.refresh()
-
-            picker()
+            picker.view()
             create_folder = ui.checkbox("Create the folder if it doesn't exist", value=True).props("dense")
             instructions = ui.textarea("Instructions — what should the assistant do in this project?",
                                        placeholder=INSTRUCTIONS_HINT).classes("w-full") \
@@ -1817,11 +1832,332 @@ class Workbench:
 
     # ---------- settings dialog
 
+    # ---------- download documents from a web page (no LLM involved)
+
+    async def web_download_dialog(self):
+        opts = webfetch.options()
+        st = {"scan": None, "selected": set(), "filter": "All", "results": [], "running": False, "cancel": False,
+              "dest": "project" if self.project else "other", "last_refresh": 0.0}
+
+        with self.root, ui.dialog().props("persistent") as dialog, ui.card().classes("w-[780px] max-w-full gap-1"):
+            with ui.row().classes("w-full items-center justify-between no-wrap"):
+                ui.label("Download documents from a web page").classes("font-semibold text-base")
+                close_btn = ui.button(icon="close", on_click=lambda: dialog.close()).props("flat dense round size=sm")
+            ui.label("Nothing is sent to the AI model: you choose the page and the files, and they are downloaded "
+                     "straight into your folder.").classes("muted text-xs")
+
+            with ui.stepper().props("vertical flat animated").classes("w-full") as stepper:
+                # 1 ---------------------------------------------------------------- web address
+                with ui.step("Web address", icon="link"):
+                    url_in = ui.input("Page or document address", placeholder="https://www.example.com/reports") \
+                        .props("outlined dense autofocus clearable").classes("w-full")
+                    allowed = opts["allowed_domains"]
+                    ui.label(("Allowed websites: " + ", ".join(allowed)) if allowed else
+                             "Any website you type can be opened (limit this in Settings → Web). Only that one page "
+                             "is read; no links are followed.").classes("muted text-xs")
+                    scan_msg = ui.label("").classes("err text-xs")
+                    with ui.stepper_navigation():
+                        scan_btn = ui.button("Scan page", icon="search", on_click=lambda: do_scan()) \
+                            .props("unelevated no-caps")
+                    url_in.on("keydown.enter", lambda: do_scan())
+
+                # 2 ---------------------------------------------------------------- checklist
+                with ui.step("Choose documents", icon="checklist"):
+                    @ui.refreshable
+                    def checklist():
+                        sc = st["scan"]
+                        if not sc:
+                            return
+                        items = sc["items"]
+                        with ui.column().classes("w-full gap-0"):
+                            ui.label(sc["title"]).classes("font-medium ellipsis1 w-full")
+                            ui.label(sc["url"]).classes("muted text-xs ellipsis1 w-full")
+                        if not items:
+                            ui.label("No document links (PDF, Word, Excel, PowerPoint, CSV, text) were found on this "
+                                     "page. Pages that need a sign-in, or that build their links with JavaScript, "
+                                     "can't be scanned: download those in your browser and upload them instead.") \
+                                .classes("text-sm")
+                            with ui.stepper_navigation():
+                                ui.button("Back", on_click=stepper.previous).props("flat no-caps")
+                            return
+                        types = ["All"] + sorted({i["type"] for i in items})
+                        shown = [i for i in items if st["filter"] in ("All", i["type"])]
+                        with ui.row().classes("w-full items-center gap-1"):
+                            if len(types) > 2:
+                                for t in types:
+                                    n = len(items) if t == "All" else sum(i["type"] == t for i in items)
+                                    ui.button(f"{t} ({n})", on_click=lambda t=t: (st.update(filter=t), checklist.refresh())) \
+                                        .props(f"{'unelevated' if st['filter'] == t else 'outline'} dense no-caps size=sm")
+                            ui.space()
+                            ui.button("Select all", on_click=lambda: select([i["url"] for i in shown if i["allowed"]], True)) \
+                                .props("flat dense no-caps size=sm")
+                            ui.button("Clear", on_click=lambda: select([i["url"] for i in shown], False)) \
+                                .props("flat dense no-caps size=sm")
+                        with ui.scroll_area().classes("w-full h-72").style("border:1px solid var(--wb-border);border-radius:8px"):
+                            for i in shown:
+                                with ui.row().classes(f"fs-row w-full no-wrap items-start {'' if i['allowed'] else 'fs-off'}"):
+                                    ui.checkbox(value=i["url"] in st["selected"],
+                                                on_change=lambda e, u=i["url"]: select([u], e.value, whole=False)) \
+                                        .props("dense").set_enabled(i["allowed"])
+                                    type_badge(i["name"])
+                                    with ui.column().classes("grow gap-0 min-w-0"):
+                                        ui.label(i["name"]).classes("ellipsis1 w-full font-medium").tooltip(i["url"])
+                                        if i["text"] and i["text"].lower() != i["name"].lower():
+                                            ui.label(i["text"]).classes("muted text-xs ellipsis1 w-full")
+                                    if i["other_site"]:
+                                        ui.badge(i["host"], color="orange").props("outline") \
+                                            .tooltip("This file is on another website than the page")
+                                    if not i["allowed"]:
+                                        ui.label("not an allowed website").classes("muted text-xs")
+                                    ui.label(file_size(i["size"]) if i["size"] else "").classes("muted text-xs w-16 text-right")
+                        checklist_nav()
+
+                    @ui.refreshable
+                    def checklist_nav():
+                        n, cap = len(st["selected"]), int(opts["max_files"])
+                        with ui.stepper_navigation():
+                            ui.button(f"Next ({n} selected)", on_click=stepper.next) \
+                                .props("unelevated no-caps").set_enabled(0 < n <= cap)
+                            ui.button("Back", on_click=stepper.previous).props("flat no-caps")
+                            if n > cap:
+                                ui.label(f"At most {cap} files per download (Settings → Web).").classes("err text-xs")
+
+                    def select(urls, on, whole=True):
+                        for u in urls:
+                            (st["selected"].add if on else st["selected"].discard)(u)
+                        (checklist if whole else checklist_nav).refresh()
+
+                    checklist()
+
+                # 3 ---------------------------------------------------------------- destination
+                with ui.step("Save to", icon="folder"):
+                    project_row = None
+                    if self.project:
+                        ui.radio({"project": f"The project folder ({self.project['name']})", "other": "Another folder"},
+                                 value=st["dest"], on_change=lambda e: set_dest(e.value)).props("dense")
+                        with ui.row().classes("w-full items-center gap-2 no-wrap") as project_row:
+                            ui.html(f"<code class='wrap-anywhere'>{html.escape(self.project['folder'])}</code>") \
+                                .classes("muted text-xs")
+                            ui.label("/").classes("muted")
+                            sub_in = ui.input("Subfolder (optional)", value="downloads").props("outlined dense") \
+                                .classes("w-56")
+                    with ui.column().classes("w-full gap-1") as other_box:
+                        with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                            other_in = ui.input(placeholder="/Users/you/Documents/reports  or  S:\\Team\\reports") \
+                                .props("outlined dense").classes("grow")
+                            picker = FolderPicker(other_in)
+                            ui.button("Browse…", on_click=picker.toggle).props("outline no-caps")
+                        picker.view()
+                    ui.label("If a file with the same name is already there:").classes("muted text-xs pt-2")
+                    on_exists = ui.radio({"skip": "Skip it", "keep": "Keep both (adds “(2)” to the new name)",
+                                          "replace": "Replace it"}, value="skip").props("dense inline").classes("text-sm")
+                    dest_msg = ui.label("").classes("err text-xs")
+                    with ui.stepper_navigation():
+                        ui.button("Download", icon="download", on_click=lambda: start()).props("unelevated no-caps")
+                        ui.button("Back", on_click=stepper.previous).props("flat no-caps")
+
+                    def set_dest(value):
+                        st["dest"] = value
+                        dest_msg.set_text("")
+                        if project_row:
+                            project_row.set_visibility(value == "project")
+                        other_box.set_visibility(value == "other")
+                    set_dest(st["dest"])
+
+                # 4 ---------------------------------------------------------------- download
+                with ui.step("Download", icon="downloading"):
+                    @ui.refreshable
+                    def progress_view():
+                        rows = st["results"]
+                        if not rows:
+                            return
+                        finished = sum(r["status"] not in ("waiting", "downloading") for r in rows)
+                        ui.linear_progress(value=finished / len(rows), show_value=False).props("rounded size=8px")
+                        ui.label(f"{finished} of {len(rows)} done").classes("muted text-xs")
+                        icons = {"waiting": ("schedule", "muted"), "downloading": ("downloading", "text-primary"),
+                                 "saved": ("check_circle", "text-positive"), "skipped": ("remove_circle_outline", "muted"),
+                                 "failed": ("error", "text-negative"), "cancelled": ("block", "muted")}
+                        with ui.scroll_area().classes("w-full h-56"):
+                            for r in rows:
+                                icon, cls = icons[r["status"]]
+                                with ui.row().classes("w-full items-center gap-2 no-wrap fs-row"):
+                                    ui.icon(icon, size="xs").classes(cls)
+                                    ui.label(r["item"]["name"]).classes("ellipsis1 grow")
+                                    if r["status"] == "downloading":
+                                        ui.label(file_size(r["done"]) + (f" of {file_size(r['total'])}" if r["total"] else ""))\
+                                            .classes("muted text-xs")
+                                    elif r["msg"]:
+                                        ui.label(r["msg"]).classes(f"text-xs {'err' if r['status'] == 'failed' else 'muted'} ellipsis1") \
+                                            .style("max-width:60%").tooltip(r["msg"])
+                        with ui.stepper_navigation():
+                            ui.button("Stop", on_click=lambda: st.update(cancel=True)).props("outline no-caps") \
+                                .set_enabled(st["running"] and not st["cancel"])
+
+                    progress_view()
+
+                # 5 ---------------------------------------------------------------- result
+                with ui.step("Done", icon="task_alt"):
+                    @ui.refreshable
+                    def result_view():
+                        rows = st["results"]
+                        saved = [r for r in rows if r["status"] == "saved"]
+                        skipped = [r for r in rows if r["status"] == "skipped"]
+                        failed = [r for r in rows if r["status"] in ("failed", "cancelled")]
+                        parts = [f"{len(saved)} saved"] + ([f"{len(skipped)} skipped (already there)"] if skipped else []) \
+                            + ([f"{len(failed)} not downloaded"] if failed else [])
+                        ui.label(" · ".join(parts)).classes("font-medium")
+                        if saved:
+                            folder = str(Path(saved[0]["path"]).parent)
+                            ui.html(f"<code class='wrap-anywhere'>{html.escape(folder)}</code>").classes("muted text-xs")
+                        for r in failed:
+                            ui.label(f"✗ {r['item']['name']}: {r['msg']}").classes("err text-xs")
+                        readable = [r["path"] for r in saved + skipped
+                                    if Path(r["path"]).suffix.lower() in fs.SUPPORTED and Path(r["path"]).exists()]
+                        with ui.stepper_navigation():
+                            if readable:
+                                ui.button(f"Attach to chat ({len(readable)})", icon="attach_file",
+                                          on_click=lambda: use(readable, "chat")).props("unelevated no-caps")
+                                if self.project:
+                                    ui.button(f"Add to project context ({len(readable)})", icon="library_add",
+                                              on_click=lambda: use(readable, "context")).props("outline no-caps")
+                            ui.button("Another page", on_click=lambda: restart()).props("flat no-caps")
+                            ui.button("Close", on_click=lambda: dialog.close()).props("flat no-caps")
+                        if saved and len(readable) < len(saved + skipped):
+                            ui.label("CSV, Excel, PowerPoint and older Office files are saved but can't be read in a chat "
+                                     "(PDF, Word, Text and Markdown can).").classes("muted text-xs")
+
+                    result_view()
+
+        async def do_scan():
+            scan_msg.set_text("")
+            if not (url_in.value or "").strip():
+                scan_msg.set_text("Type or paste a web address.")
+                return
+            scan_btn.props("loading")
+            try:
+                sc = await webfetch.scan(url_in.value)
+                try:
+                    await asyncio.wait_for(webfetch.probe([i for i in sc["items"][:200]]), timeout=20)
+                except asyncio.TimeoutError:
+                    pass
+            except webfetch.FetchError as e:
+                scan_msg.set_text(str(e))
+                return
+            except httpx.HTTPError as e:
+                scan_msg.set_text(f"Could not open the page: {e.__class__.__name__} {e}".strip())
+                return
+            except Exception as e:
+                scan_msg.set_text(f"Could not read the page: {e}")
+                return
+            finally:
+                scan_btn.props(remove="loading")
+            st.update(scan=sc, filter="All", selected={i["url"] for i in sc["items"] if sc["direct"] and i["allowed"]})
+            checklist.refresh()
+            stepper.next()
+
+        def dest_folder() -> Path:
+            if st["dest"] == "project":
+                parts = [p for p in (sub_in.value or "").replace("\\", "/").split("/") if p.strip() not in ("", ".", "..")]
+                if parts and parts[0] == projects.META:
+                    raise ValueError(f"{projects.META} is reserved for the app.")
+                folder = Path(self.project["folder"]).joinpath(*(re.sub(r'[<>:"|?*]', "_", p).strip() for p in parts))
+                folder.mkdir(parents=True, exist_ok=True)
+                return folder
+            value = (other_in.value or "").strip()
+            if not value:
+                raise ValueError("Choose a folder (type its path or use Browse…).")
+            folder = fs._abs(value)
+            if not folder.is_dir():
+                raise ValueError(f"{folder} doesn't exist.")
+            return folder
+
+        def refresh_progress(force=False):
+            now = time.monotonic()
+            if force or now - st["last_refresh"] > 0.25:
+                st["last_refresh"] = now
+                progress_view.refresh()
+
+        async def start():
+            try:
+                folder = await asyncio.to_thread(dest_folder)
+            except Exception as e:
+                dest_msg.set_text(str(e))
+                return
+            dest_msg.set_text("")
+            items = [i for i in st["scan"]["items"] if i["url"] in st["selected"]]
+            st.update(results=[{"item": i, "status": "waiting", "msg": "", "path": "", "done": 0, "total": None}
+                               for i in items], running=True, cancel=False)
+            close_btn.set_enabled(False)
+            stepper.next()
+            progress_view.refresh()
+            for r in st["results"]:
+                if st["cancel"]:
+                    r.update(status="cancelled", msg="stopped")
+                    continue
+                r["status"] = "downloading"
+                refresh_progress(True)
+
+                def progress(done, total, r=r):
+                    r.update(done=done, total=total)
+                    refresh_progress()
+                try:
+                    out = await webfetch.download(r["item"], folder, on_exists.value, progress)
+                    r.update(status=out["status"], path=out["path"],
+                             msg=Path(out["path"]).name if out["status"] == "saved" else "already there")
+                except webfetch.FetchError as e:
+                    r.update(status="failed", msg=str(e))
+                except httpx.HTTPError as e:
+                    r.update(status="failed", msg=f"Network error: {e.__class__.__name__} {e}".strip())
+                except OSError as e:
+                    r.update(status="failed", msg=f"Could not write the file: {e}")
+                refresh_progress(True)
+            st["running"] = False
+            close_btn.set_enabled(True)
+            progress_view.refresh()
+            result_view.refresh()
+            stepper.next()
+
+        def restart():
+            st.update(scan=None, selected=set(), results=[])
+            checklist.refresh()
+            progress_view.refresh()
+            result_view.refresh()
+            stepper.set_value("Web address")
+
+        async def use(paths, where):
+            dialog.close()
+            if where == "context":
+                inside = [p for p in paths if Path(self.project["folder"]).resolve() in Path(p).resolve().parents]
+                outside = [p for p in paths if p not in inside]
+                metas = await asyncio.to_thread(projects.add_paths, self.project["id"], inside) if inside else []
+                for p in outside:
+                    metas.append(await asyncio.to_thread(projects.add_upload, self.project["id"], Path(p).name,
+                                                         Path(p).read_bytes()))
+                self.project_notice = report(metas)
+                self.reload_project()
+                self.main.refresh()
+                self.composer.refresh()
+                return
+
+            def ingest(paths):
+                out = []
+                for p in paths:
+                    try:
+                        out.append({"ok": True, **documents.meta(documents.ingest(Path(p)))})
+                    except Exception as e:
+                        out.append({"ok": False, "name": Path(p).name, "error": str(e)})
+                return out
+            self.attach_metas(await asyncio.to_thread(ingest, paths))
+
+        dialog.on("hide", dialog.delete)
+        dialog.open()
+
     async def settings_dialog(self):
         s = settings.load()
         draft = {name: {k: v for k, v in p.items() if k != "api_key"} for name, p in s["providers"].items()}
         keys = {name: "" for name in draft}
         folders = list(s["allowed_folders"])
+        web = dict(s["web"])
         active = {"name": s["active_provider"]}
 
         with self.root, ui.dialog() as dialog, ui.card().classes("w-[600px] max-w-full"):
@@ -1831,6 +2167,7 @@ class Workbench:
             with ui.tabs().classes("w-full").props("dense align=left no-caps") as tabs:
                 tab_objs = {name: ui.tab(name, label=p["label"]) for name, p in draft.items()}
                 ui.tab("_folders", label="Folders")
+                ui.tab("_web", label="Web")
             with ui.tab_panels(tabs, value=tab_objs[active["name"]]).classes("w-full"):
                 for name, p in draft.items():
                     with ui.tab_panel(name).classes("gap-2 px-0"):
@@ -1858,8 +2195,27 @@ class Workbench:
                                 folder_list.refresh()
                         ui.button("Add", on_click=add_folder).props("outline no-caps")
 
+                with ui.tab_panel("_web").classes("gap-2 px-0"):
+                    ui.label("Used by “From web”: downloading documents from a web page you name. The AI model is "
+                             "not involved; only plain downloads, no sign-ins or cookies.").classes("muted text-xs")
+                    domains = ui.textarea("Allowed websites, one per line (empty = any website you type)",
+                                          value="\n".join(web["allowed_domains"]),
+                                          placeholder="intranet.company.com\nsec.gov").props("outlined autogrow") \
+                        .classes("w-full")
+                    domains.on("update:model-value", lambda e: web.update(
+                        allowed_domains=[d for d in (e.args or "").splitlines() if d.strip()]))
+                    ui.label("A website also allows its subdomains (company.com allows www.company.com).") \
+                        .classes("muted text-xs")
+                    with ui.row().classes("gap-3"):
+                        ui.number("Max size per file (MB)", min=1, max=500, step=1, format="%d") \
+                            .bind_value(web, "max_file_mb").props("outlined dense").classes("w-48")
+                        ui.number("Max files per download", min=1, max=200, step=1, format="%d") \
+                            .bind_value(web, "max_files").props("outlined dense").classes("w-48")
+                    ui.checkbox("Use the system proxy settings (the company proxy)").bind_value(web, "use_system_proxy") \
+                        .props("dense")
+
             def save():
-                body = {"active_provider": active["name"], "allowed_folders": folders,
+                body = {"active_provider": active["name"], "allowed_folders": folders, "web": web,
                         "providers": {n: {**p, "api_key": keys[n]} for n, p in draft.items()}}
                 settings.update(body)
                 self.sidebar.refresh()

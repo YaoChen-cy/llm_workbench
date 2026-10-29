@@ -50,6 +50,9 @@ DEFAULTS = {
     },
     # Folders the file browser may read. Everything outside them is refused.
     "allowed_folders": [],
+    # "Download from web": websites documents may be downloaded from (empty = any site the user types),
+    # size limit per file, files per run, and whether to go through the system/company proxy.
+    "web": {"allowed_domains": [], "max_file_mb": 50, "max_files": 30, "use_system_proxy": True},
 }
 
 _lock = threading.Lock()
@@ -102,6 +105,15 @@ def update(incoming: dict) -> dict:
         cur.update(p)
     if incoming.get("active_provider") in s["providers"]:
         s["active_provider"] = incoming["active_provider"]
+    if "web" in incoming:
+        w = incoming["web"]
+        s["web"]["allowed_domains"] = sorted({d.strip().lower().lstrip("*.").rstrip("/") for d in
+                                              w.get("allowed_domains", s["web"]["allowed_domains"]) if d.strip()})
+        for key, low, high in (("max_file_mb", 1, 500), ("max_files", 1, 200)):
+            if key in w:
+                s["web"][key] = max(low, min(high, int(w[key] or s["web"][key])))
+        if "use_system_proxy" in w:
+            s["web"]["use_system_proxy"] = bool(w["use_system_proxy"])
     if "allowed_folders" in incoming:
         s["allowed_folders"] = [str(Path(f).expanduser().resolve()) for f in incoming["allowed_folders"] if f.strip()]
     save(s)

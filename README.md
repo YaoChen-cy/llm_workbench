@@ -2,15 +2,13 @@
 
 本地运行的 LLM 交互界面（英文 UI）：可以浏览本地文件夹、给对话 attach 多个文件，回答中的每个事实都带来源引用，鼠标悬停即可看到原文。
 
-> 原来的 CIP 月度总结流程移到了 [`cip/`](cip/README.md)，用法不变，只是要先 `cd cip`。M3 会把它改造成第一个 Project。
-
 ## 启动
 
 ```bash
 python start.py        # Windows 用 py start.py
 ```
 
-首次运行会在 `.venv` 中建 Python 环境并安装 `requirements.txt`（需要 Python 3.10+，以及 pip 能访问 PyPI 或公司镜像；有代理时设置 `HTTPS_PROXY` 或 `PIP_INDEX_URL`），然后自动打开 http://localhost:8000 。可选参数：`--port 8001`、`--no-browser`、`--reinstall`。
+首次运行会在 `.venv` 中建 Python 环境并安装 `requirements.txt`（版本固定在 `constraints.txt`，需要 Python 3.11+，以及 pip 能访问 PyPI 或公司镜像；有代理时设置 `HTTPS_PROXY` 或 `PIP_INDEX_URL`），然后自动打开 http://localhost:8000 。可选参数：`--port 8001`、`--no-browser`、`--reinstall`。
 
 **整个应用都是 Python**：界面用 [NiceGUI](https://github.com/zauberzeug/nicegui) 编写（`backend/ui.py`），它的浏览器端文件由 pip 安装，仓库里没有 JS/CSS/HTML 文件，也不需要 Node.js。
 
@@ -59,9 +57,37 @@ python start.py        # Windows 用 py start.py
 - **Save to project folder**（仅项目内）：保存到项目文件夹（可以有子目录，如 `drafts/summary.docx`），不能写到项目文件夹之外；同名文件会先询问是否覆盖
 - **Download**：通过浏览器下载
 
-支持 `.md`、`.txt`、`.csv`、`.json`、`.docx`。`.docx` 由模型写成 Markdown（标题、列表、粗体、表格），保存时转换成 Word。保存 `.docx` / `.md` / `.txt` 时，引用 ID 会变成 `[1]`、`[2]`…，文末附 **Sources** 列表（文件名、页码、章节和原文摘录），离开本应用也能追溯来源。
+支持 `.md`、`.txt`、`.csv`、`.json`、`.docx`、`.xlsx`、`.pptx`。后三种由模型写成 Markdown，保存时在本地转换（不联网）：
+
+- `.docx`（python-docx）：标题、列表、粗体、表格
+- `.xlsx`（openpyxl）：每个 `## 标题` 一个工作表，Markdown 表格写成单元格；数字、百分比、金额存成真正的数字；引用放在 "Source" 列
+- `.pptx`（python-pptx）：`# 标题` 生成封面页，每个 `## 标题` 一页（16:9），支持多级要点和表格；以 `Notes:` 开头的行写入演讲者备注；内容太多会自动续页（cont.）
+
+保存 `.docx` / `.xlsx` / `.pptx` / `.md` / `.txt` 时，引用 ID 会变成 `[1]`、`[2]`…，并附 **Sources** 列表（Word/Markdown 在文末，Excel 是单独的 Sources 工作表，PPT 是最后的 Sources 页；内容包括文件名、页码、章节和原文摘录），离开本应用也能追溯来源。
 
 实现方式：system prompt 告诉模型用 `<file path="名字.扩展名">…</file>` 包住文件内容（`backend/outputs.py`）。
+
+## 从网页下载文档（From web）
+
+右上角 **From web** 打开一个分步骤的流程（项目内外都可以用）：
+
+1. **Web address**：输入网页地址（或直接是一个 PDF 的地址）
+2. **Choose documents**：列出这一页上的文档链接（PDF、Word、Excel、PowerPoint、CSV、文本），显示文件名、链接文字、大小；可按类型筛选、全选；指向其他网站的链接会用橙色标出
+3. **Save to**：存到项目文件夹（可指定子文件夹，默认 `downloads/`），或用 Browse… 选任意文件夹（含共享盘）；同名文件可选跳过 / 两个都保留 / 替换
+4. **Download**：逐个下载，显示进度，可以中途停止
+5. **Done**：列出保存的文件和失败原因；可以直接 **Attach to chat** 或 **Add to project context**，之后就能总结并点击引用定位原文
+
+**也可以直接在 chat 里贴链接**：消息里带网址（`http(s)://…` 或 `www.…`）时，这条消息**不会发给模型**，而是在对话末尾出现同样的步骤卡片，自动扫描这一页（只用第一个网址）。Attach to chat 之后，消息里除网址以外的文字会放回输入框，按 Enter 就能接着问。如果确实想把这条带链接的消息发给模型（模型自己打不开链接），点卡片右上角 **Send to the model instead**。
+
+**安全规则**（这个流程不经过 AI 模型，下载什么由用户自己勾选，所以网页里的内容无法让程序把数据发出去）：
+
+- 只用普通的 GET/HEAD 请求：不执行 JavaScript、不保留 cookie、不提交表单，只读你输入的那一页，不会继续跟链接
+- 只接受 http/https；带用户名密码的地址会被拒绝；重定向最多 5 次，每一跳都重新检查
+- 只下载文档类型，并检查文件开头确实是该格式（比如登录页面冒充的 "report.pdf" 会被拒绝）
+- 文件只写进你选的文件夹（不限制文件大小和个数）
+- **Settings → Web**：允许的网站（每行一个，留空 = 你输入的任何网站；`company.com` 也允许 `www.company.com`）、是否使用系统 / 公司代理
+
+需要登录、或者链接是 JavaScript 动态生成的网页扫不出文档，这种情况请在浏览器里下载后上传。
 
 ## 来源定位（M2）
 
@@ -101,12 +127,12 @@ backend/
   documents.py   通用解析（PDF/DOCX/TXT/MD）、引用句子定位、带高亮的页面渲染
   chats.py       会话存储、prompt 拼装、超长文档的段落筛选
   projects.py    项目：instructions、context、文件夹沙盒、输出写入
-  outputs.py     模型生成的文件：解析 <file> 块、Markdown 转 Word
+  outputs.py     模型生成的文件：解析 <file> 块、Markdown 转 Word / Excel / PowerPoint
   knowledge.py   知识库：样本、学习 profile（测量 + 分析 + 合并）、pinned 规则、draft 检查
   alignment.py   summary ↔ 原文对齐与测量（出处、覆盖、长度、原句比例、数字）
   citations.py   宽松的引用识别（各种写法都能点击）
+  webfetch.py    从网页下载文档：扫描链接、检查规则、下载（httpx + lxml，不经过 LLM）
 data/            运行时数据（git-ignored）：docs/ 解析缓存，chats/ 会话，uploads/ 上传文件
-cip/             原 CIP 月度总结流程
 ```
 
 > 早期的 React 版界面保留在 git 分支 `feat/m1-chat-ui` 上。

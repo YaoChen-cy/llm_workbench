@@ -57,7 +57,7 @@ def summary_points(md: str) -> list[dict]:
     return points
 
 
-# ---------------------------------------------------------------- numbers (tolerant matching, from cip/verify.py)
+# ---------------------------------------------------------------- numbers (tolerant matching)
 
 _SCALE = {"bn": 1e9, "billion": 1e9, "mm": 1e6, "m": 1e6, "million": 1e6, "k": 1e3, "": 1}
 _NUM = re.compile(r"(?<![\w.])(?P<cur>\$)?(?P<num>\d{1,3}(?:,\d{3})+|\d+)(?P<dec>\.\d+)?"

@@ -3,8 +3,8 @@ Start LLM Workbench (Windows, macOS, Linux):
 
     python start.py            Windows: py start.py   (or double-click if .py opens with Python)
 
-First run creates a .venv folder and installs requirements.txt with pip. Behind a company proxy or mirror,
-pip's usual settings apply (HTTPS_PROXY, PIP_INDEX_URL, or a pip.ini / pip.conf).
+First run creates a .venv folder and installs requirements.txt with pip (exact versions from constraints.txt).
+Behind a company proxy or mirror, pip's usual settings apply (HTTPS_PROXY, PIP_INDEX_URL, or a pip.ini / pip.conf).
 Settings for the company LLM can go in env.txt (copy env.example.txt) or be entered in the app.
 
 Options:  --port 8000   --no-browser   --reinstall
@@ -24,21 +24,23 @@ ROOT = Path(__file__).resolve().parent
 VENV = ROOT / ".venv"
 PY = VENV / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 REQS = ROOT / "requirements.txt"
-STAMP = VENV / "requirements.installed.txt"      # copy of requirements.txt from the last successful install
+CONSTRAINTS = ROOT / "constraints.txt"           # exact versions of all dependencies
+STAMP = VENV / "requirements.installed.txt"      # copy of requirements + constraints from the last successful install
 
 
 def ensure_env(reinstall: bool):
-    if sys.version_info < (3, 10):
-        sys.exit(f"Python 3.10 or newer is required (this is {sys.version.split()[0]}).")
+    if sys.version_info < (3, 11):
+        sys.exit(f"Python 3.11 or newer is required (this is {sys.version.split()[0]}).")
     if not PY.exists():
         print("Creating the Python environment in .venv ...")
         venv.EnvBuilder(with_pip=True).create(VENV)
-    if reinstall or not STAMP.exists() or STAMP.read_text("utf-8") != REQS.read_text("utf-8"):
+    wanted = REQS.read_text("utf-8") + CONSTRAINTS.read_text("utf-8")
+    if reinstall or not STAMP.exists() or STAMP.read_text("utf-8") != wanted:
         print("Installing dependencies (first run only, a few minutes) ...")
-        cmd = [str(PY), "-m", "pip", "install", "--only-binary=pymupdf", "-r", str(REQS)]
+        cmd = [str(PY), "-m", "pip", "install", "--only-binary=pymupdf", "-r", str(REQS), "-c", str(CONSTRAINTS)]
         if subprocess.call(cmd) != 0:
             sys.exit("\npip install failed. If you are behind a proxy, set HTTPS_PROXY or PIP_INDEX_URL and run again.")
-        STAMP.write_text(REQS.read_text("utf-8"), "utf-8")
+        STAMP.write_text(wanted, "utf-8")
 
 
 def load_env_file():

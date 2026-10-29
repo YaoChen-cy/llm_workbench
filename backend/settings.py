@@ -49,7 +49,10 @@ DEFAULTS = {
         },
     },
     # Folders the file browser may read. Everything outside them is refused.
-    "allowed_folders": [str(ROOT / "cip" / "input"), str(ROOT / "cip" / "eval")],
+    "allowed_folders": [],
+    # "Download from web": websites documents may be downloaded from (empty = any site the user types)
+    # and whether to go through the system/company proxy.
+    "web": {"allowed_domains": [], "use_system_proxy": True},
 }
 
 _lock = threading.Lock()
@@ -66,6 +69,8 @@ def load() -> dict:
     with _lock:
         saved = json.loads(SETTINGS_FILE.read_text("utf-8")) if SETTINGS_FILE.exists() else {}
     s = _merge(DEFAULTS, saved)
+    for old_key in ("max_file_mb", "max_files"):          # limits from an earlier version, no longer used
+        s["web"].pop(old_key, None)
     co = s["providers"]["company"]
     for env, key in (("LLM_BASE_URL", "base_url"), ("LLM_API_KEY", "api_key"), ("LLM_MODEL", "model")):
         if os.getenv(env):
@@ -102,6 +107,12 @@ def update(incoming: dict) -> dict:
         cur.update(p)
     if incoming.get("active_provider") in s["providers"]:
         s["active_provider"] = incoming["active_provider"]
+    if "web" in incoming:
+        w = incoming["web"]
+        s["web"]["allowed_domains"] = sorted({d.strip().lower().lstrip("*.").rstrip("/") for d in
+                                              w.get("allowed_domains", s["web"]["allowed_domains"]) if d.strip()})
+        if "use_system_proxy" in w:
+            s["web"]["use_system_proxy"] = bool(w["use_system_proxy"])
     if "allowed_folders" in incoming:
         s["allowed_folders"] = [str(Path(f).expanduser().resolve()) for f in incoming["allowed_folders"] if f.strip()]
     save(s)

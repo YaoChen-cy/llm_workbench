@@ -50,9 +50,9 @@ DEFAULTS = {
     },
     # Folders the file browser may read. Everything outside them is refused.
     "allowed_folders": [],
-    # "Download from web": websites documents may be downloaded from (empty = any site the user types),
-    # size limit per file, files per run, and whether to go through the system/company proxy.
-    "web": {"allowed_domains": [], "max_file_mb": 50, "max_files": 30, "use_system_proxy": True},
+    # "Download from web": websites documents may be downloaded from (empty = any site the user types)
+    # and whether to go through the system/company proxy.
+    "web": {"allowed_domains": [], "use_system_proxy": True},
 }
 
 _lock = threading.Lock()
@@ -69,6 +69,8 @@ def load() -> dict:
     with _lock:
         saved = json.loads(SETTINGS_FILE.read_text("utf-8")) if SETTINGS_FILE.exists() else {}
     s = _merge(DEFAULTS, saved)
+    for old_key in ("max_file_mb", "max_files"):          # limits from an earlier version, no longer used
+        s["web"].pop(old_key, None)
     co = s["providers"]["company"]
     for env, key in (("LLM_BASE_URL", "base_url"), ("LLM_API_KEY", "api_key"), ("LLM_MODEL", "model")):
         if os.getenv(env):
@@ -109,9 +111,6 @@ def update(incoming: dict) -> dict:
         w = incoming["web"]
         s["web"]["allowed_domains"] = sorted({d.strip().lower().lstrip("*.").rstrip("/") for d in
                                               w.get("allowed_domains", s["web"]["allowed_domains"]) if d.strip()})
-        for key, low, high in (("max_file_mb", 1, 500), ("max_files", 1, 200)):
-            if key in w:
-                s["web"][key] = max(low, min(high, int(w[key] or s["web"][key])))
         if "use_system_proxy" in w:
             s["web"]["use_system_proxy"] = bool(w["use_system_proxy"])
     if "allowed_folders" in incoming:

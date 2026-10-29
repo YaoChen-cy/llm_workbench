@@ -11,7 +11,7 @@ Safety rules (the LLM is not involved; the user types the URL and ticks the file
 - every redirect hop is checked again (at most 5), and against the domain allowlist when one is set
 - only document types (PDF, Word, Excel, PowerPoint, CSV, text); the file's first bytes must match its type,
   so a login page saved as "report.pdf" is refused
-- size limit per file, a limit on files per run; files are written only into the chosen folder
+- files are written only into the chosen folder (no size or count limits)
 Uses the system proxy settings (company proxy) unless Settings → Web says otherwise.
 """
 import asyncio
@@ -243,14 +243,11 @@ async def download(item: dict, folder: Path, on_exists: str = "skip", progress=N
     """Save one checklist item into `folder`. Returns {"status": "saved"|"skipped", "path"}; raises FetchError.
     progress(done_bytes, total_bytes or None) is called while downloading."""
     opts = options()
-    limit = int(opts["max_file_mb"]) * 1024 * 1024
     folder = folder.resolve()
     async with _client(opts) as client:
         r = await _open(client, item["url"], opts)
         try:
             total = int(r.headers["content-length"]) if r.headers.get("content-length", "").isdigit() else None
-            if total and total > limit:
-                raise FetchError(f"The file is {total / 1048576:.0f} MB; the limit is {opts['max_file_mb']} MB.")
             name = _safe_name(_disposition_name(r.headers.get("content-disposition", "")) or item["name"], item["suffix"])
             dest = target_path(folder, name, on_exists)
             if dest is None:
@@ -266,8 +263,6 @@ async def download(item: dict, folder: Path, on_exists: str = "skip", progress=N
                             _check_start(chunk, item["suffix"])
                             checked = True
                         done += len(chunk)
-                        if done > limit:
-                            raise FetchError(f"The file is larger than the {opts['max_file_mb']} MB limit.")
                         f.write(chunk)
                         if progress:
                             progress(done, total)

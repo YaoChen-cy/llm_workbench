@@ -1914,13 +1914,11 @@ class Workbench:
 
                     @ui.refreshable
                     def checklist_nav():
-                        n, cap = len(st["selected"]), int(opts["max_files"])
+                        n = len(st["selected"])
                         with ui.stepper_navigation():
                             ui.button(f"Next ({n} selected)", on_click=stepper.next) \
-                                .props("unelevated no-caps").set_enabled(0 < n <= cap)
+                                .props("unelevated no-caps").set_enabled(n > 0)
                             ui.button("Back", on_click=stepper.previous).props("flat no-caps")
-                            if n > cap:
-                                ui.label(f"At most {cap} files per download (Settings → Web).").classes("err text-xs")
 
                     def select(urls, on, whole=True):
                         for u in urls:
@@ -2206,11 +2204,6 @@ class Workbench:
                         allowed_domains=[d for d in (e.args or "").splitlines() if d.strip()]))
                     ui.label("A website also allows its subdomains (company.com allows www.company.com).") \
                         .classes("muted text-xs")
-                    with ui.row().classes("gap-3"):
-                        ui.number("Max size per file (MB)", min=1, max=500, step=1, format="%d") \
-                            .bind_value(web, "max_file_mb").props("outlined dense").classes("w-48")
-                        ui.number("Max files per download", min=1, max=200, step=1, format="%d") \
-                            .bind_value(web, "max_files").props("outlined dense").classes("w-48")
                     ui.checkbox("Use the system proxy settings (the company proxy)").bind_value(web, "use_system_proxy") \
                         .props("dense")
 

@@ -146,7 +146,11 @@ class BrowserSession:
         except Exception as e:
             if "Download is starting" in str(e) or "ERR_ABORTED" in str(e):
                 return None, True
-            raise FetchError(f"The page could not be opened: {str(e).splitlines()[0]}")
+            first = str(e).splitlines()[0]
+            if "Timeout" in first or "ERR_CONNECTION" in first or "ERR_NAME_NOT_RESOLVED" in first:
+                raise FetchError("The page could not be reached, neither directly nor in the browser. Check the address "
+                                 f"and whether it needs the company network or VPN. ({first})")
+            raise FetchError(f"The page could not be opened: {first}")
         try:
             await page.wait_for_load_state("networkidle", timeout=10_000)
         except Exception:

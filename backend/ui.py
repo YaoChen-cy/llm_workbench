@@ -873,7 +873,7 @@ class Workbench:
         chat["messages"] = chat["messages"][:index]
         chats.save(chat)
         self.chat, self.editing = chat, None
-        await self.send(text)
+        await self.send(text, links=True)
 
     # ---------- composer
 
@@ -1258,19 +1258,22 @@ class Workbench:
 
     # ---------- sending
 
-    async def send(self, text: str | None = None):
+    async def send(self, text: str | None = None, links: bool | None = None):
+        """Send a message: typed in the box (text None) or given (an edited message, a card's follow-up).
+        links: handle a web address in it first (default: for typed messages)."""
         from_input = text is None
         text = ((self.input.value or "") if from_input else text).strip()
         if not text or self.pending:
             return
-        if from_input and (found := find_url(text)):      # a link: download steps, or the page for the model
+        if (from_input if links is None else links) and (found := find_url(text)):   # download steps, or read the page
             url, rest = found
             intent = web_intent(url, rest)
             if intent == "download":
-                if self.open_web_card(url, rest, original=text):
+                if self.open_web_card(url, rest, original=text) and from_input:
                     self.input.value = ""
                 return
-            self.input.value = ""
+            if from_input:
+                self.input.value = ""
             if intent == "choose":
                 self.web_choice(url)
                 return
@@ -2009,7 +2012,7 @@ class Workbench:
         try:
             try:
                 got = await webfetch.read(url, folder)
-            except webfetch.SignInNeeded:
+            except webfetch.BrowserNeeded:
                 st["browser"] = browserfetch.BrowserSession()
                 got = await st["browser"].read(url, folder, status.set_text)
             doc = await asyncio.to_thread(documents.ingest, Path(got["path"]), got["name"])
@@ -2334,7 +2337,7 @@ class Workbench:
                 if not browser:
                     try:
                         sc = await webfetch.scan(url)
-                    except webfetch.SignInNeeded:
+                    except webfetch.BrowserNeeded:
                         pass
                 if sc is None:
                     release_browser(st)

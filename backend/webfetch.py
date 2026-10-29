@@ -20,6 +20,7 @@ certificate open as they do in the browser. Certificates are always verified.
 import asyncio
 import re
 import ssl
+import urllib.request
 from pathlib import Path
 from urllib.parse import unquote, urldefrag, urljoin, urlsplit
 
@@ -61,8 +62,13 @@ class FetchError(Exception):
     pass
 
 
-class SignInNeeded(FetchError):
-    """The page asks for a sign-in: the From web steps then open it in the browser (browserfetch)."""
+class BrowserNeeded(FetchError):
+    """Only the browser can open the page (browserfetch): it needs a sign-in, builds its text with JavaScript, or is
+    on a network the browser reaches through the company's proxy settings and plain requests don't."""
+
+
+class SignInNeeded(BrowserNeeded):
+    """The page asks for a sign-in."""
 
 
 # Sign-in services a company site may send the browser to
@@ -127,8 +133,19 @@ def network_error(e: Exception, prefix: str) -> str:
     return f"{prefix}: {e.__class__.__name__} {text}".strip()
 
 
-def _client(opts: dict) -> httpx.AsyncClient:
-    return httpx.AsyncClient(follow_redirects=False, timeout=TIMEOUT, trust_env=bool(opts.get("use_system_proxy", True)),
+def _use_proxy(opts: dict, url: str) -> bool:
+    """Whether requests to url go through the system proxy: not when the system says to bypass it for that host
+    (Windows: Internet Options → "Don't use the proxy server for addresses beginning with", usually the intranet)."""
+    if not opts.get("use_system_proxy", True):
+        return False
+    try:
+        return not urllib.request.proxy_bypass(urlsplit(url).hostname or "")
+    except Exception:
+        return True
+
+
+def _client(opts: dict, url: str = "") -> httpx.AsyncClient:
+    return httpx.AsyncClient(follow_redirects=False, timeout=TIMEOUT, trust_env=_use_proxy(opts, url),
                              verify=_ssl_context(),
                              headers={"User-Agent": USER_AGENT})
 
@@ -137,7 +154,11 @@ async def _open(client: httpx.AsyncClient, url: str, opts: dict, method: str = "
     """Send the request, following redirects by hand so every hop is checked. The caller closes the response."""
     for _ in range(MAX_REDIRECTS + 1):
         url = check_url(url, opts)
-        r = await client.send(client.build_request(method, url), stream=True)
+        try:
+            r = await client.send(client.build_request(method, url), stream=True)
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError) as e:
+            # The browser may still get there: it uses all the system's proxy settings (PAC scripts included)
+            raise BrowserNeeded(network_error(e, "Could not connect directly")) from e
         client.cookies.clear()                          # nothing is remembered between requests
         if r.status_code in (301, 302, 303, 307, 308) and "location" in r.headers:
             await r.aclose()
@@ -182,7 +203,7 @@ async def scan(url: str) -> dict:
 
     opts = options()
     url = check_url(url, opts)
-    async with _client(opts) as client:
+    async with _client(opts, url) as client:
         r = await _open(client, url, opts)
         try:
             final = str(r.url)
@@ -240,7 +261,7 @@ async def probe(items: list[dict], limit: int = 6):
             except Exception:
                 pass
 
-    async with _client(opts) as client:
+    async with _client(opts, items[0]["url"] if items else "") as client:
         await asyncio.gather(*(one(client, it) for it in items if it["allowed"] and it["size"] is None))
 
 
@@ -286,7 +307,7 @@ async def download(item: dict, folder: Path, on_exists: str = "skip", progress=N
     progress(done_bytes, total_bytes or None) is called while downloading."""
     opts = options()
     folder = folder.resolve()
-    async with _client(opts) as client:
+    async with _client(opts, item["url"]) as client:
         r = await _open(client, item["url"], opts)
         try:
             total = int(r.headers["content-length"]) if r.headers.get("content-length", "").isdigit() else None
@@ -442,10 +463,10 @@ def page_file(folder: Path, url: str, title: str, markdown: str) -> dict:
 
 async def read(url: str, folder: Path) -> dict:
     """The page at url as a Markdown file in folder, or the document url points to: {"path", "name", "url"}.
-    Raises SignInNeeded when the page asks for a sign-in (the caller then uses browserfetch)."""
+    Raises BrowserNeeded when only the browser can open the page (the caller then uses browserfetch)."""
     opts = options()
     url = check_url(url, opts)
-    async with _client(opts) as client:
+    async with _client(opts, url) as client:
         r = await _open(client, url, opts)
         try:
             final = str(r.url)
@@ -462,7 +483,7 @@ async def read(url: str, folder: Path) -> dict:
         return {"path": out["path"], "name": Path(out["path"]).name, "url": final}
     if "html" not in ctype and not ctype.startswith("text/"):
         raise FetchError(f"This address is neither a web page nor a readable document ({ctype.split(';')[0]}).")
-    async with _client(opts) as client:          # read the page itself (the first request only looked at the type)
+    async with _client(opts, url) as client:     # read the page itself (the first request only looked at the type)
         r = await _open(client, url, opts)
         try:
             final, charset, body = str(r.url), r.charset_encoding, bytearray()
@@ -479,5 +500,5 @@ async def read(url: str, folder: Path) -> dict:
         raise SignInNeeded("The page is a sign-in form.")
     title, md = html_to_markdown(text, final)
     if text_length(md) < MIN_TEXT:            # built by JavaScript, or a redirect page: read it in the browser
-        raise SignInNeeded("The page has almost no text without JavaScript.")
+        raise BrowserNeeded("The page has almost no text without JavaScript.")
     return page_file(folder, final, title, md)

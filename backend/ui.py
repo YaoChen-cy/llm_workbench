@@ -79,6 +79,7 @@ body.body--dark .t-md, body.body--dark .t-txt { background: #1d3a2a; color: #7fd
 .fs-row { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 6px; width: 100%; }
 .fs-row.click { cursor: pointer; } .fs-row.click:hover { background: var(--wb-bg); }
 .fs-off { opacity: .45; }
+.web-card { border: 1px solid var(--wb-accent); box-shadow: none; margin-bottom: 16px; }
 .q-drawer .q-scrollarea__content { width: 100%; max-width: 100%; }
 .fs-row > * { min-width: 0; }
 .quote mark, .text-view mark { background: var(--wb-hl); color: inherit; border-radius: 2px; }
@@ -282,6 +283,22 @@ CONVERTED = {".docx": "Written in Markdown; saved as a Word document.",
              ".pptx": "Written in Markdown; saved as a PowerPoint deck (a slide per ## heading)."}
 
 
+URL_RE = re.compile(r"(?:https?://|www\.)[^\s<>\"'`，。；、！？）】」》]+", re.I)
+
+
+def find_url(text: str) -> tuple[str, str] | None:
+    """The first web address typed in a chat message, and the message without it."""
+    m = URL_RE.search(text)
+    if not m:
+        return None
+    url = m.group(0)
+    while url and (url[-1] in ".,;:!?'\"]}>" or (url[-1] == ")" and url.count("(") < url.count(")"))):
+        url = url[:-1]
+    rest = re.sub(r"\s+", " ", text[:m.start()] + text[m.start() + len(url):]).strip()
+    rest = rest if re.search(r"\w", rest) else ""
+    return (url, rest) if len(url) > 7 else None
+
+
 def is_text_file(path: str) -> bool:
     return Path(path).suffix.lower() in TEXT_FILES
 
@@ -444,6 +461,7 @@ class Workbench:
         self.fit_cache: dict = {}               # (chat, message, profile version) -> profile checks
         self.left_width = 260                   # drawer widths in px, changed by dragging their borders
         self.right_widths = {"source": 560, "files": 320}
+        self.web_state: dict | None = None      # the "From web" card in the chat, while it is open
 
     # ---------- feedback that survives refreshes
 
@@ -515,6 +533,8 @@ class Workbench:
         with self.footer:
             self.composer()
         self.main()
+        # The "From web" card for a message with a link: outside main() so refreshes leave it in place.
+        self.web_slot = ui.column().classes("w-full max-w-[1100px] mx-auto gap-0")
 
     # ---------- sidebar
 
@@ -1103,6 +1123,7 @@ class Workbench:
             return
         self.chat, self.notice, self.project_notice = None, "", ""
         self.editing = None
+        self.drop_idle_web_card()
         try:
             self.project = projects.get(pid) if pid else None
         except FileNotFoundError as e:
@@ -1116,6 +1137,7 @@ class Workbench:
         if self.pending:
             return
         self.chat, self.notice, self.editing = chats.get(cid), "", None
+        self.drop_idle_web_card()
         if self.right in ("context", "source"):
             self.toggle_right(None)
         self.refresh_all()
@@ -1124,6 +1146,7 @@ class Workbench:
         if self.pending:
             return
         self.notice, self.editing = "", None
+        self.drop_idle_web_card()
         self.chat = chats.create(self.project["id"]) if self.project else None
         if self.right == "context":
             self.toggle_right(None)
@@ -1196,6 +1219,10 @@ class Workbench:
         from_input = text is None
         text = ((self.input.value or "") if from_input else text).strip()
         if not text or self.pending:
+            return
+        if from_input and (found := find_url(text)):      # a link: the download steps, not the model
+            if self.open_web_card(*found, original=text):
+                self.input.value = ""
             return
         if from_input:
             self.input.value = ""
@@ -1835,196 +1862,241 @@ class Workbench:
     # ---------- download documents from a web page (no LLM involved)
 
     async def web_download_dialog(self):
-        opts = webfetch.options()
-        st = {"scan": None, "selected": set(), "filter": "All", "results": [], "running": False, "cancel": False,
-              "dest": "project" if self.project else "other", "last_refresh": 0.0}
-
         with self.root, ui.dialog().props("persistent") as dialog, ui.card().classes("w-[780px] max-w-full gap-1"):
             with ui.row().classes("w-full items-center justify-between no-wrap"):
                 ui.label("Download documents from a web page").classes("font-semibold text-base")
                 close_btn = ui.button(icon="close", on_click=lambda: dialog.close()).props("flat dense round size=sm")
             ui.label("Nothing is sent to the AI model: you choose the page and the files, and they are downloaded "
                      "straight into your folder.").classes("muted text-xs")
+            self.web_steps(dialog.close, close_btn.set_enabled)
+        dialog.on("hide", dialog.delete)
+        dialog.open()
 
-            with ui.stepper().props("vertical flat animated").classes("w-full") as stepper:
-                # 1 ---------------------------------------------------------------- web address
-                with ui.step("Web address", icon="link"):
-                    url_in = ui.input("Page or document address", placeholder="https://www.example.com/reports") \
-                        .props("outlined dense autofocus clearable").classes("w-full")
-                    allowed = opts["allowed_domains"]
-                    ui.label(("Allowed websites: " + ", ".join(allowed)) if allowed else
-                             "Any website you type can be opened (limit this in Settings → Web). Only that one page "
-                             "is read; no links are followed.").classes("muted text-xs")
-                    scan_msg = ui.label("").classes("err text-xs")
-                    with ui.stepper_navigation():
-                        scan_btn = ui.button("Scan page", icon="search", on_click=lambda: do_scan()) \
-                            .props("unelevated no-caps")
-                    url_in.on("keydown.enter", lambda: do_scan())
+    def open_web_card(self, url: str, rest: str, original: str) -> bool:
+        """The same steps as a card at the end of the chat, for a message that contains a web address.
+        The message is not sent to the model; the rest of it goes back into the box once the files are attached."""
+        if self.web_state and self.web_state["running"]:
+            self.notify("A download is still running in the chat. Wait for it or stop it first.", type="warning")
+            return False
+        self.web_slot.clear()
+        with self.web_slot, ui.card().classes("w-full gap-1 web-card"):
+            with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                ui.icon("travel_explore", color="primary")
+                ui.label("Download documents from this link").classes("font-semibold grow")
+                as_msg = ui.button("Send to the model instead", on_click=lambda: self.web_card_as_message(original)) \
+                    .props("flat dense no-caps size=sm color=primary") \
+                    .tooltip("Send your message as a normal chat message (the model can't open the link)")
+                close_btn = ui.button(icon="close", on_click=self.close_web_card).props("flat dense round size=sm")
+            ui.label("Your message contains a web address, so it was not sent to the AI model. Pick the files and a "
+                     "folder below; they are downloaded straight into it and can then be attached to this chat.") \
+                .classes("muted text-xs")
 
-                # 2 ---------------------------------------------------------------- checklist
-                with ui.step("Choose documents", icon="checklist"):
-                    @ui.refreshable
-                    def checklist():
-                        sc = st["scan"]
-                        if not sc:
-                            return
-                        items = sc["items"]
-                        with ui.column().classes("w-full gap-0"):
-                            ui.label(sc["title"]).classes("font-medium ellipsis1 w-full")
-                            ui.label(sc["url"]).classes("muted text-xs ellipsis1 w-full")
-                        if not items:
-                            ui.label("No document links (PDF, Word, Excel, PowerPoint, CSV, text) were found on this "
-                                     "page. Pages that need a sign-in, or that build their links with JavaScript, "
-                                     "can't be scanned: download those in your browser and upload them instead.") \
-                                .classes("text-sm")
-                            with ui.stepper_navigation():
-                                ui.button("Back", on_click=stepper.previous).props("flat no-caps")
-                            return
-                        types = ["All"] + sorted({i["type"] for i in items})
-                        shown = [i for i in items if st["filter"] in ("All", i["type"])]
-                        with ui.row().classes("w-full items-center gap-1"):
-                            if len(types) > 2:
-                                for t in types:
-                                    n = len(items) if t == "All" else sum(i["type"] == t for i in items)
-                                    ui.button(f"{t} ({n})", on_click=lambda t=t: (st.update(filter=t), checklist.refresh())) \
-                                        .props(f"{'unelevated' if st['filter'] == t else 'outline'} dense no-caps size=sm")
-                            ui.space()
-                            ui.button("Select all", on_click=lambda: select([i["url"] for i in shown if i["allowed"]], True)) \
-                                .props("flat dense no-caps size=sm")
-                            ui.button("Clear", on_click=lambda: select([i["url"] for i in shown], False)) \
-                                .props("flat dense no-caps size=sm")
-                        with ui.scroll_area().classes("w-full h-72").style("border:1px solid var(--wb-border);border-radius:8px"):
-                            for i in shown:
-                                with ui.row().classes(f"fs-row w-full no-wrap items-start {'' if i['allowed'] else 'fs-off'}"):
-                                    ui.checkbox(value=i["url"] in st["selected"],
-                                                on_change=lambda e, u=i["url"]: select([u], e.value, whole=False)) \
-                                        .props("dense").set_enabled(i["allowed"])
-                                    type_badge(i["name"])
-                                    with ui.column().classes("grow gap-0 min-w-0"):
-                                        ui.label(i["name"]).classes("ellipsis1 w-full font-medium").tooltip(i["url"])
-                                        if i["text"] and i["text"].lower() != i["name"].lower():
-                                            ui.label(i["text"]).classes("muted text-xs ellipsis1 w-full")
-                                    if i["other_site"]:
-                                        ui.badge(i["host"], color="orange").props("outline") \
-                                            .tooltip("This file is on another website than the page")
-                                    if not i["allowed"]:
-                                        ui.label("not an allowed website").classes("muted text-xs")
-                                    ui.label(file_size(i["size"]) if i["size"] else "").classes("muted text-xs w-16 text-right")
-                        checklist_nav()
+            def closable(on: bool):
+                close_btn.set_enabled(on)
+                as_msg.set_enabled(on)
+            self.web_state = self.web_steps(self.close_web_card, closable, url=url, followup=rest)
+        self.client.run_javascript("setTimeout(() => window.scrollTo(0, document.body.scrollHeight), 100)")
+        return True
 
-                    @ui.refreshable
-                    def checklist_nav():
-                        n = len(st["selected"])
+    def close_web_card(self):
+        self.web_slot.clear()
+        self.web_state = None
+
+    async def web_card_as_message(self, text: str):
+        self.close_web_card()
+        await self.send(text)
+
+    def drop_idle_web_card(self):
+        """Switching chat or project: an unfinished card goes away, a running download stays visible."""
+        if self.web_state and not self.web_state["running"]:
+            self.close_web_card()
+
+    def web_steps(self, close, closable, url: str = "", followup: str = "") -> dict:
+        """The "From web" workflow as a vertical stepper in the current container (the dialog or the chat card).
+        close() ends the workflow; closable(bool) enables its close controls (off while downloading)."""
+        opts = webfetch.options()
+        st = {"scan": None, "selected": set(), "filter": "All", "results": [], "running": False, "cancel": False,
+              "dest": "project" if self.project else "other", "last_refresh": 0.0}
+
+        with ui.stepper().props("vertical flat animated").classes("w-full") as stepper:
+            # 1 ---------------------------------------------------------------- web address
+            with ui.step("Web address", icon="link"):
+                url_in = ui.input("Page or document address", value=url, placeholder="https://www.example.com/reports") \
+                    .props(f"outlined dense clearable {'' if url else 'autofocus'}").classes("w-full")
+                allowed = opts["allowed_domains"]
+                ui.label(("Allowed websites: " + ", ".join(allowed)) if allowed else
+                         "Any website you type can be opened (limit this in Settings → Web). Only that one page "
+                         "is read; no links are followed.").classes("muted text-xs")
+                scan_msg = ui.label("").classes("err text-xs")
+                with ui.stepper_navigation():
+                    scan_btn = ui.button("Scan page", icon="search", on_click=lambda: do_scan()) \
+                        .props("unelevated no-caps")
+                url_in.on("keydown.enter", lambda: do_scan())
+
+            # 2 ---------------------------------------------------------------- checklist
+            with ui.step("Choose documents", icon="checklist"):
+                @ui.refreshable
+                def checklist():
+                    sc = st["scan"]
+                    if not sc:
+                        return
+                    items = sc["items"]
+                    with ui.column().classes("w-full gap-0"):
+                        ui.label(sc["title"]).classes("font-medium ellipsis1 w-full")
+                        ui.label(sc["url"]).classes("muted text-xs ellipsis1 w-full")
+                    if not items:
+                        ui.label("No document links (PDF, Word, Excel, PowerPoint, CSV, text) were found on this "
+                                 "page. Pages that need a sign-in, or that build their links with JavaScript, "
+                                 "can't be scanned: download those in your browser and upload them instead.") \
+                            .classes("text-sm")
                         with ui.stepper_navigation():
-                            ui.button(f"Next ({n} selected)", on_click=stepper.next) \
-                                .props("unelevated no-caps").set_enabled(n > 0)
                             ui.button("Back", on_click=stepper.previous).props("flat no-caps")
+                        return
+                    types = ["All"] + sorted({i["type"] for i in items})
+                    shown = [i for i in items if st["filter"] in ("All", i["type"])]
+                    with ui.row().classes("w-full items-center gap-1"):
+                        if len(types) > 2:
+                            for t in types:
+                                n = len(items) if t == "All" else sum(i["type"] == t for i in items)
+                                ui.button(f"{t} ({n})", on_click=lambda t=t: (st.update(filter=t), checklist.refresh())) \
+                                    .props(f"{'unelevated' if st['filter'] == t else 'outline'} dense no-caps size=sm")
+                        ui.space()
+                        ui.button("Select all", on_click=lambda: select([i["url"] for i in shown if i["allowed"]], True)) \
+                            .props("flat dense no-caps size=sm")
+                        ui.button("Clear", on_click=lambda: select([i["url"] for i in shown], False)) \
+                            .props("flat dense no-caps size=sm")
+                    with ui.scroll_area().classes("w-full h-72").style("border:1px solid var(--wb-border);border-radius:8px"):
+                        for i in shown:
+                            with ui.row().classes(f"fs-row w-full no-wrap items-start {'' if i['allowed'] else 'fs-off'}"):
+                                ui.checkbox(value=i["url"] in st["selected"],
+                                            on_change=lambda e, u=i["url"]: select([u], e.value, whole=False)) \
+                                    .props("dense").set_enabled(i["allowed"])
+                                type_badge(i["name"])
+                                with ui.column().classes("grow gap-0 min-w-0"):
+                                    ui.label(i["name"]).classes("ellipsis1 w-full font-medium").tooltip(i["url"])
+                                    if i["text"] and i["text"].lower() != i["name"].lower():
+                                        ui.label(i["text"]).classes("muted text-xs ellipsis1 w-full")
+                                if i["other_site"]:
+                                    ui.badge(i["host"], color="orange").props("outline") \
+                                        .tooltip("This file is on another website than the page")
+                                if not i["allowed"]:
+                                    ui.label("not an allowed website").classes("muted text-xs")
+                                ui.label(file_size(i["size"]) if i["size"] else "").classes("muted text-xs w-16 text-right")
+                    checklist_nav()
 
-                    def select(urls, on, whole=True):
-                        for u in urls:
-                            (st["selected"].add if on else st["selected"].discard)(u)
-                        (checklist if whole else checklist_nav).refresh()
-
-                    checklist()
-
-                # 3 ---------------------------------------------------------------- destination
-                with ui.step("Save to", icon="folder"):
-                    project_row = None
-                    if self.project:
-                        ui.radio({"project": f"The project folder ({self.project['name']})", "other": "Another folder"},
-                                 value=st["dest"], on_change=lambda e: set_dest(e.value)).props("dense")
-                        with ui.row().classes("w-full items-center gap-2 no-wrap") as project_row:
-                            ui.html(f"<code class='wrap-anywhere'>{html.escape(self.project['folder'])}</code>") \
-                                .classes("muted text-xs")
-                            ui.label("/").classes("muted")
-                            sub_in = ui.input("Subfolder (optional)", value="downloads").props("outlined dense") \
-                                .classes("w-56")
-                    with ui.column().classes("w-full gap-1") as other_box:
-                        with ui.row().classes("w-full items-center gap-2 no-wrap"):
-                            other_in = ui.input(placeholder="/Users/you/Documents/reports  or  S:\\Team\\reports") \
-                                .props("outlined dense").classes("grow")
-                            picker = FolderPicker(other_in)
-                            ui.button("Browse…", on_click=picker.toggle).props("outline no-caps")
-                        picker.view()
-                    ui.label("If a file with the same name is already there:").classes("muted text-xs pt-2")
-                    on_exists = ui.radio({"skip": "Skip it", "keep": "Keep both (adds “(2)” to the new name)",
-                                          "replace": "Replace it"}, value="skip").props("dense inline").classes("text-sm")
-                    dest_msg = ui.label("").classes("err text-xs")
+                @ui.refreshable
+                def checklist_nav():
+                    n = len(st["selected"])
                     with ui.stepper_navigation():
-                        ui.button("Download", icon="download", on_click=lambda: start()).props("unelevated no-caps")
+                        ui.button(f"Next ({n} selected)", on_click=stepper.next) \
+                            .props("unelevated no-caps").set_enabled(n > 0)
                         ui.button("Back", on_click=stepper.previous).props("flat no-caps")
 
-                    def set_dest(value):
-                        st["dest"] = value
-                        dest_msg.set_text("")
-                        if project_row:
-                            project_row.set_visibility(value == "project")
-                        other_box.set_visibility(value == "other")
-                    set_dest(st["dest"])
+                def select(urls, on, whole=True):
+                    for u in urls:
+                        (st["selected"].add if on else st["selected"].discard)(u)
+                    (checklist if whole else checklist_nav).refresh()
 
-                # 4 ---------------------------------------------------------------- download
-                with ui.step("Download", icon="downloading"):
-                    @ui.refreshable
-                    def progress_view():
-                        rows = st["results"]
-                        if not rows:
-                            return
-                        finished = sum(r["status"] not in ("waiting", "downloading") for r in rows)
-                        ui.linear_progress(value=finished / len(rows), show_value=False).props("rounded size=8px")
-                        ui.label(f"{finished} of {len(rows)} done").classes("muted text-xs")
-                        icons = {"waiting": ("schedule", "muted"), "downloading": ("downloading", "text-primary"),
-                                 "saved": ("check_circle", "text-positive"), "skipped": ("remove_circle_outline", "muted"),
-                                 "failed": ("error", "text-negative"), "cancelled": ("block", "muted")}
-                        with ui.scroll_area().classes("w-full h-56"):
-                            for r in rows:
-                                icon, cls = icons[r["status"]]
-                                with ui.row().classes("w-full items-center gap-2 no-wrap fs-row"):
-                                    ui.icon(icon, size="xs").classes(cls)
-                                    ui.label(r["item"]["name"]).classes("ellipsis1 grow")
-                                    if r["status"] == "downloading":
-                                        ui.label(file_size(r["done"]) + (f" of {file_size(r['total'])}" if r["total"] else ""))\
-                                            .classes("muted text-xs")
-                                    elif r["msg"]:
-                                        ui.label(r["msg"]).classes(f"text-xs {'err' if r['status'] == 'failed' else 'muted'} ellipsis1") \
-                                            .style("max-width:60%").tooltip(r["msg"])
-                        with ui.stepper_navigation():
-                            ui.button("Stop", on_click=lambda: st.update(cancel=True)).props("outline no-caps") \
-                                .set_enabled(st["running"] and not st["cancel"])
+                checklist()
 
-                    progress_view()
+            # 3 ---------------------------------------------------------------- destination
+            with ui.step("Save to", icon="folder"):
+                project_row = None
+                if self.project:
+                    ui.radio({"project": f"The project folder ({self.project['name']})", "other": "Another folder"},
+                             value=st["dest"], on_change=lambda e: set_dest(e.value)).props("dense")
+                    with ui.row().classes("w-full items-center gap-2 no-wrap") as project_row:
+                        ui.html(f"<code class='wrap-anywhere'>{html.escape(self.project['folder'])}</code>") \
+                            .classes("muted text-xs")
+                        ui.label("/").classes("muted")
+                        sub_in = ui.input("Subfolder (optional)", value="downloads").props("outlined dense") \
+                            .classes("w-56")
+                with ui.column().classes("w-full gap-1") as other_box:
+                    with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                        other_in = ui.input(placeholder="/Users/you/Documents/reports  or  S:\\Team\\reports") \
+                            .props("outlined dense").classes("grow")
+                        picker = FolderPicker(other_in)
+                        ui.button("Browse…", on_click=picker.toggle).props("outline no-caps")
+                    picker.view()
+                ui.label("If a file with the same name is already there:").classes("muted text-xs pt-2")
+                on_exists = ui.radio({"skip": "Skip it", "keep": "Keep both (adds “(2)” to the new name)",
+                                      "replace": "Replace it"}, value="skip").props("dense inline").classes("text-sm")
+                dest_msg = ui.label("").classes("err text-xs")
+                with ui.stepper_navigation():
+                    ui.button("Download", icon="download", on_click=lambda: start()).props("unelevated no-caps")
+                    ui.button("Back", on_click=stepper.previous).props("flat no-caps")
 
-                # 5 ---------------------------------------------------------------- result
-                with ui.step("Done", icon="task_alt"):
-                    @ui.refreshable
-                    def result_view():
-                        rows = st["results"]
-                        saved = [r for r in rows if r["status"] == "saved"]
-                        skipped = [r for r in rows if r["status"] == "skipped"]
-                        failed = [r for r in rows if r["status"] in ("failed", "cancelled")]
-                        parts = [f"{len(saved)} saved"] + ([f"{len(skipped)} skipped (already there)"] if skipped else []) \
-                            + ([f"{len(failed)} not downloaded"] if failed else [])
-                        ui.label(" · ".join(parts)).classes("font-medium")
-                        if saved:
-                            folder = str(Path(saved[0]["path"]).parent)
-                            ui.html(f"<code class='wrap-anywhere'>{html.escape(folder)}</code>").classes("muted text-xs")
-                        for r in failed:
-                            ui.label(f"✗ {r['item']['name']}: {r['msg']}").classes("err text-xs")
-                        readable = [r["path"] for r in saved + skipped
-                                    if Path(r["path"]).suffix.lower() in fs.SUPPORTED and Path(r["path"]).exists()]
-                        with ui.stepper_navigation():
-                            if readable:
-                                ui.button(f"Attach to chat ({len(readable)})", icon="attach_file",
-                                          on_click=lambda: use(readable, "chat")).props("unelevated no-caps")
-                                if self.project:
-                                    ui.button(f"Add to project context ({len(readable)})", icon="library_add",
-                                              on_click=lambda: use(readable, "context")).props("outline no-caps")
-                            ui.button("Another page", on_click=lambda: restart()).props("flat no-caps")
-                            ui.button("Close", on_click=lambda: dialog.close()).props("flat no-caps")
-                        if saved and len(readable) < len(saved + skipped):
-                            ui.label("CSV, Excel, PowerPoint and older Office files are saved but can't be read in a chat "
-                                     "(PDF, Word, Text and Markdown can).").classes("muted text-xs")
+                def set_dest(value):
+                    st["dest"] = value
+                    dest_msg.set_text("")
+                    if project_row:
+                        project_row.set_visibility(value == "project")
+                    other_box.set_visibility(value == "other")
+                set_dest(st["dest"])
 
-                    result_view()
+            # 4 ---------------------------------------------------------------- download
+            with ui.step("Download", icon="downloading"):
+                @ui.refreshable
+                def progress_view():
+                    rows = st["results"]
+                    if not rows:
+                        return
+                    finished = sum(r["status"] not in ("waiting", "downloading") for r in rows)
+                    ui.linear_progress(value=finished / len(rows), show_value=False).props("rounded size=8px")
+                    ui.label(f"{finished} of {len(rows)} done").classes("muted text-xs")
+                    icons = {"waiting": ("schedule", "muted"), "downloading": ("downloading", "text-primary"),
+                             "saved": ("check_circle", "text-positive"), "skipped": ("remove_circle_outline", "muted"),
+                             "failed": ("error", "text-negative"), "cancelled": ("block", "muted")}
+                    with ui.scroll_area().classes("w-full h-56"):
+                        for r in rows:
+                            icon, cls = icons[r["status"]]
+                            with ui.row().classes("w-full items-center gap-2 no-wrap fs-row"):
+                                ui.icon(icon, size="xs").classes(cls)
+                                ui.label(r["item"]["name"]).classes("ellipsis1 grow")
+                                if r["status"] == "downloading":
+                                    ui.label(file_size(r["done"]) + (f" of {file_size(r['total'])}" if r["total"] else ""))\
+                                        .classes("muted text-xs")
+                                elif r["msg"]:
+                                    ui.label(r["msg"]).classes(f"text-xs {'err' if r['status'] == 'failed' else 'muted'} ellipsis1") \
+                                        .style("max-width:60%").tooltip(r["msg"])
+                    with ui.stepper_navigation():
+                        ui.button("Stop", on_click=lambda: st.update(cancel=True)).props("outline no-caps") \
+                            .set_enabled(st["running"] and not st["cancel"])
+
+                progress_view()
+
+            # 5 ---------------------------------------------------------------- result
+            with ui.step("Done", icon="task_alt"):
+                @ui.refreshable
+                def result_view():
+                    rows = st["results"]
+                    saved = [r for r in rows if r["status"] == "saved"]
+                    skipped = [r for r in rows if r["status"] == "skipped"]
+                    failed = [r for r in rows if r["status"] in ("failed", "cancelled")]
+                    parts = [f"{len(saved)} saved"] + ([f"{len(skipped)} skipped (already there)"] if skipped else []) \
+                        + ([f"{len(failed)} not downloaded"] if failed else [])
+                    ui.label(" · ".join(parts)).classes("font-medium")
+                    if saved:
+                        folder = str(Path(saved[0]["path"]).parent)
+                        ui.html(f"<code class='wrap-anywhere'>{html.escape(folder)}</code>").classes("muted text-xs")
+                    for r in failed:
+                        ui.label(f"✗ {r['item']['name']}: {r['msg']}").classes("err text-xs")
+                    readable = [r["path"] for r in saved + skipped
+                                if Path(r["path"]).suffix.lower() in fs.SUPPORTED and Path(r["path"]).exists()]
+                    with ui.stepper_navigation():
+                        if readable:
+                            ui.button(f"Attach to chat ({len(readable)})", icon="attach_file",
+                                      on_click=lambda: use(readable, "chat")).props("unelevated no-caps")
+                            if self.project:
+                                ui.button(f"Add to project context ({len(readable)})", icon="library_add",
+                                          on_click=lambda: use(readable, "context")).props("outline no-caps")
+                        ui.button("Another page", on_click=lambda: restart()).props("flat no-caps")
+                        ui.button("Close", on_click=close).props("flat no-caps")
+                    if saved and len(readable) < len(saved + skipped):
+                        ui.label("CSV, Excel, PowerPoint and older Office files are saved but can't be read in a chat "
+                                 "(PDF, Word, Text and Markdown can).").classes("muted text-xs")
+
+                result_view()
 
         async def do_scan():
             scan_msg.set_text("")
@@ -2085,7 +2157,7 @@ class Workbench:
             items = [i for i in st["scan"]["items"] if i["url"] in st["selected"]]
             st.update(results=[{"item": i, "status": "waiting", "msg": "", "path": "", "done": 0, "total": None}
                                for i in items], running=True, cancel=False)
-            close_btn.set_enabled(False)
+            closable(False)
             stepper.next()
             progress_view.refresh()
             for r in st["results"]:
@@ -2110,7 +2182,7 @@ class Workbench:
                     r.update(status="failed", msg=f"Could not write the file: {e}")
                 refresh_progress(True)
             st["running"] = False
-            close_btn.set_enabled(True)
+            closable(True)
             progress_view.refresh()
             result_view.refresh()
             stepper.next()
@@ -2123,7 +2195,7 @@ class Workbench:
             stepper.set_value("Web address")
 
         async def use(paths, where):
-            dialog.close()
+            close()
             if where == "context":
                 inside = [p for p in paths if Path(self.project["folder"]).resolve() in Path(p).resolve().parents]
                 outside = [p for p in paths if p not in inside]
@@ -2146,9 +2218,13 @@ class Workbench:
                         out.append({"ok": False, "name": Path(p).name, "error": str(e)})
                 return out
             self.attach_metas(await asyncio.to_thread(ingest, paths))
+            if followup:                        # the rest of the chat message, ready to send about the files
+                self.input.value = followup
+                self.client.run_javascript("document.querySelector('.wb-footer textarea')?.focus()")
 
-        dialog.on("hide", dialog.delete)
-        dialog.open()
+        if url:
+            ui.timer(0.1, lambda: do_scan(), once=True)
+        return st
 
     async def settings_dialog(self):
         s = settings.load()

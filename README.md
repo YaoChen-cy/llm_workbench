@@ -77,6 +77,8 @@ python start.py        # Windows 用 py start.py
 4. **Download**：逐个下载，显示进度，可以中途停止
 5. **Done**：列出保存的文件和失败原因；可以直接 **Attach to chat** 或 **Add to project context**，之后就能总结并点击引用定位原文
 
+**也可以直接在 chat 里贴链接**：消息里带网址（`http(s)://…` 或 `www.…`）时，这条消息**不会发给模型**，而是在对话末尾出现同样的步骤卡片，自动扫描这一页（只用第一个网址）。Attach to chat 之后，消息里除网址以外的文字会放回输入框，按 Enter 就能接着问。如果确实想把这条带链接的消息发给模型（模型自己打不开链接），点卡片右上角 **Send to the model instead**。
+
 **安全规则**（这个流程不经过 AI 模型，下载什么由用户自己勾选，所以网页里的内容无法让程序把数据发出去）：
 
 - 只用普通的 GET/HEAD 请求：不执行 JavaScript、不保留 cookie、不提交表单，只读你输入的那一页，不会继续跟链接

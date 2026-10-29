@@ -57,7 +57,13 @@ python start.py        # Windows 用 py start.py
 - **Save to project folder**（仅项目内）：保存到项目文件夹（可以有子目录，如 `drafts/summary.docx`），不能写到项目文件夹之外；同名文件会先询问是否覆盖
 - **Download**：通过浏览器下载
 
-支持 `.md`、`.txt`、`.csv`、`.json`、`.docx`。`.docx` 由模型写成 Markdown（标题、列表、粗体、表格），保存时转换成 Word。保存 `.docx` / `.md` / `.txt` 时，引用 ID 会变成 `[1]`、`[2]`…，文末附 **Sources** 列表（文件名、页码、章节和原文摘录），离开本应用也能追溯来源。
+支持 `.md`、`.txt`、`.csv`、`.json`、`.docx`、`.xlsx`、`.pptx`。后三种由模型写成 Markdown，保存时在本地转换（不联网）：
+
+- `.docx`（python-docx）：标题、列表、粗体、表格
+- `.xlsx`（openpyxl）：每个 `## 标题` 一个工作表，Markdown 表格写成单元格；数字、百分比、金额存成真正的数字；引用放在 "Source" 列
+- `.pptx`（python-pptx）：`# 标题` 生成封面页，每个 `## 标题` 一页（16:9），支持多级要点和表格；以 `Notes:` 开头的行写入演讲者备注；内容太多会自动续页（cont.）
+
+保存 `.docx` / `.xlsx` / `.pptx` / `.md` / `.txt` 时，引用 ID 会变成 `[1]`、`[2]`…，并附 **Sources** 列表（Word/Markdown 在文末，Excel 是单独的 Sources 工作表，PPT 是最后的 Sources 页；内容包括文件名、页码、章节和原文摘录），离开本应用也能追溯来源。
 
 实现方式：system prompt 告诉模型用 `<file path="名字.扩展名">…</file>` 包住文件内容（`backend/outputs.py`）。
 

@@ -72,7 +72,7 @@ body.body--dark .fit-ok { color: #7fd8a4; } body.body--dark .fit-warn { color: #
 .cite.bad { background: transparent; color: var(--wb-error); outline: 1px dashed var(--wb-error); cursor: help; }
 .type-badge { display: inline-block; min-width: 46px; text-align: center; font-size: 10.5px; font-weight: 650; padding: 1px 5px; border-radius: 4px; background: var(--wb-code); color: var(--wb-muted); flex: 0 0 auto; }
 .t-pdf { background: #fde8e7; color: #b42318; } .t-docx, .t-doc { background: #e6ecfd; color: #2f5bea; }
-.t-md, .t-txt { background: #e7f6ec; color: #18794e; } .t-xlsx, .t-xls, .t-csv { background: #e3f5ef; color: #0f7a55; }
+.t-md, .t-txt { background: #e7f6ec; color: #18794e; } .t-pptx { background: #fdeee4; color: #c4410f; } .t-xlsx, .t-xls, .t-csv { background: #e3f5ef; color: #0f7a55; }
 body.body--dark .t-pdf { background: #4a2020; color: #ff9b94; } body.body--dark .t-docx { background: #24304f; color: #9db3ff; }
 body.body--dark .t-md, body.body--dark .t-txt { background: #1d3a2a; color: #7fd8a4; }
 .fs-row { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 6px; width: 100%; }
@@ -273,7 +273,12 @@ def render_answer(text: str, resolve) -> str:
     return "".join(out)
 
 
-TEXT_FILES = (".md", ".docx", ".txt")
+TEXT_FILES = tuple(outputs.MARKDOWN_TYPES)
+
+
+CONVERTED = {".docx": "Written in Markdown; saved as a Word document.",
+             ".xlsx": "Written in Markdown; saved as an Excel workbook (a sheet per ## heading, tables as cells).",
+             ".pptx": "Written in Markdown; saved as a PowerPoint deck (a slide per ## heading)."}
 
 
 def is_text_file(path: str) -> bool:
@@ -281,7 +286,7 @@ def is_text_file(path: str) -> bool:
 
 
 def streaming_view(text: str) -> str:
-    """While an answer streams: document files (.docx/.md/.txt) show their text inline, other files a placeholder."""
+    """While an answer streams: Markdown-based files (.md/.docx/.xlsx/.pptx/.txt) show their text inline, other files a placeholder."""
     out = []
     for part in outputs.split_answer(text):
         if part["kind"] == "text":
@@ -604,7 +609,7 @@ class Workbench:
     def with_sources(self, path: str, content: str) -> str:
         """Replace citation IDs with [1], [2]… and append a Sources list, so a saved file stays traceable
         outside the app. CSV/JSON files are left unchanged."""
-        if Path(path).suffix.lower() not in (".md", ".docx", ".txt"):
+        if Path(path).suffix.lower() not in outputs.MARKDOWN_TYPES:
             return content
         numbers: dict[str, int] = {}
         sources: list[str] = []
@@ -644,8 +649,9 @@ class Workbench:
                 ui.label(path).classes("font-medium ellipsis1 grow")
                 ui.label(f"{len(content):,} characters" + ("" if part["complete"] else " · incomplete")) \
                     .classes("muted text-xs")
-            if Path(path).suffix.lower() == ".docx":
-                ui.label("Written in Markdown; saved as a Word document.").classes("muted text-xs")
+            note = CONVERTED.get(Path(path).suffix.lower())
+            if note:
+                ui.label(note).classes("muted text-xs")
             with ui.row().classes("gap-2 items-center"):
                 if self.project:
                     ui.button("Save to project folder", icon="save",
@@ -658,7 +664,7 @@ class Workbench:
                 if citations.has_citations(content):
                     ui.label("Citations become numbered references with a Sources list.").classes("muted text-xs")
             with ui.expansion("Preview as saved").classes("w-full text-sm").props("dense"):
-                if Path(path).suffix.lower() in (".md", ".docx"):
+                if Path(path).suffix.lower() in (".md", ".docx", ".xlsx", ".pptx"):
                     saved = self.with_sources(path, content)
                     body, sep, sources = saved.partition("\n## Sources\n")
                     # File names like Harborline_Home_Furnishings.pdf would render "_Home_" in italics.

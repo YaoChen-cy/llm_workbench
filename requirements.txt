@@ -8,3 +8,5 @@ httpx==0.28.1
 python-multipart==0.0.32
 pymupdf==1.28.2      # Intel Macs: pip install --only-binary=pymupdf -r requirements.txt
 python-docx==1.2.0
+openpyxl==3.1.5       # Excel output
+python-pptx==1.0.2    # PowerPoint output

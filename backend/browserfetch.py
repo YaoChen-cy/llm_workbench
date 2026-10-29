@@ -238,8 +238,25 @@ class BrowserSession:
             out = await self._download(item, folder, "keep")
             return {"path": out["path"], "name": Path(out["path"]).name, "url": url}
         say("Reading the page…")
-        title, md = webfetch.html_to_markdown(await self.page.content(), self.page.url)
-        return webfetch.page_file(folder, self.page.url, title or await self.page.title(), md)
+        page = self.page
+        title, md = webfetch.html_to_markdown(await page.content(), page.url)
+        floor = webfetch.MIN_TEXT // 4
+        if webfetch.text_length(md) < floor:
+            # Content inside frames (same site only), or text the conversion missed: what the browser shows
+            parts = [md]
+            for frame in page.frames[1:]:
+                if urlsplit(frame.url)[:2] == urlsplit(page.url)[:2]:
+                    try:
+                        parts.append(webfetch.html_to_markdown(await frame.content(), frame.url)[1])
+                    except Exception:
+                        pass
+            md = "\n\n".join(p for p in parts if p.strip())
+            if webfetch.text_length(md) < floor:
+                md = (await page.inner_text("body")).strip()
+        if webfetch.text_length(md) < floor:
+            raise FetchError("The page shows no readable text (it may be an app or a document viewer, or still be "
+                             "loading). Try \"Download documents from it\", or copy the text into the chat.")
+        return webfetch.page_file(folder, page.url, title or await page.title(), md)
 
     async def _scan(self, url: str, say) -> dict:
         opts = webfetch.options()

@@ -321,8 +321,10 @@ async def download(item: dict, folder: Path, on_exists: str = "skip", progress=N
 # ---------------------------------------------------------------- reading a page (for the chat, not the download steps)
 
 READABLE = (".pdf", ".docx", ".txt", ".md")      # what the chat can read (documents.py)
-_DROP = ("script", "style", "noscript", "template", "svg", "canvas", "iframe", "nav", "footer", "aside", "form",
-         "button", "select", "dialog")
+# Left out of the text. Not <form>: ASP.NET pages (classic SharePoint, many intranet sites) wrap the whole page in one.
+_DROP = ("script", "style", "noscript", "template", "svg", "canvas", "iframe", "nav", "footer", "aside",
+         "button", "select", "option", "textarea", "input", "dialog")
+MIN_TEXT = 200                                   # less readable text than this: the page wasn't really read
 _HEADINGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
 _BLOCKS = _HEADINGS | {"p", "div", "section", "article", "main", "header", "ul", "ol", "li", "table", "pre",
                        "blockquote", "dl", "dt", "dd", "figure", "figcaption", "hr", "br", "address", "details",
@@ -410,12 +412,22 @@ def html_to_markdown(text: str, base_url: str = "") -> tuple[str, str]:
     page = lxml.html.document_fromstring(text or "<html></html>", base_url=base_url or None)
     title = _ws(page.findtext(".//title") or "")
     etree.strip_elements(page, *_DROP, etree.Comment, with_tail=False)
-    candidates = page.xpath("//main|//article|//*[@role='main']")
     body = page.find("body")
-    root = max(candidates, key=lambda e: len(e.text_content())) if candidates else (body if body is not None else page)
+    root = body if body is not None else page
+    # The main/article element when it holds most of the text (some pages have an empty <main> shell)
+    candidates = page.xpath("//main|//article|//*[@role='main']")
+    if candidates:
+        best = max(candidates, key=lambda e: len(_ws(e.text_content())))
+        if len(_ws(best.text_content())) >= 0.3 * len(_ws(root.text_content())):
+            root = best
     out: list[str] = []
     _block(root, out) if root.tag in _BLOCKS else _walk(root, out)
     return title, "\n\n".join(out)
+
+
+def text_length(markdown: str) -> int:
+    """Letters and digits in a page's text (table pipes, list marks and spacing don't count)."""
+    return len(re.findall(r"\w", markdown))
 
 
 def page_file(folder: Path, url: str, title: str, markdown: str) -> dict:
@@ -466,6 +478,6 @@ async def read(url: str, folder: Path) -> dict:
     if re.search(r"<input[^>]+type\s*=\s*[\"']?password", text, re.I):
         raise SignInNeeded("The page is a sign-in form.")
     title, md = html_to_markdown(text, final)
-    if len(md) < 200 and re.search(r"<script", text, re.I):
-        raise SignInNeeded("The page builds its content with JavaScript.")   # read it in the browser instead
+    if text_length(md) < MIN_TEXT:            # built by JavaScript, or a redirect page: read it in the browser
+        raise SignInNeeded("The page has almost no text without JavaScript.")
     return page_file(folder, final, title, md)
